@@ -1,12 +1,23 @@
-name: build
+name: ci
 
 on:
   push:
   pull_request:
 
 jobs:
-  firmware:
+  host-unity:
+    name: Host unit tests
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run host unit tests
+        run: make -C test/host test
+
+  firmware:
+    name: Firmware build (esp32s3)
+    runs-on: ubuntu-latest
+    needs: host-unity
     steps:
       - uses: actions/checkout@v4
 
