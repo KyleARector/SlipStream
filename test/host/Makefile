@@ -1,22 +1,38 @@
 CC ?= gcc
 CFLAGS = -Wall -Wextra -std=c11 -Iunity
 BUILD_DIR = build
-BIN = $(BUILD_DIR)/test_runner
+COMPONENTS_DIR = ../../components
 
-# Pure-logic component sources land here as milestones add them
-# (print_job_fsm, ble_session_fsm, escpos_formatter test files, etc.)
-SRCS = unity/unity.c test_trivial.c
+UNITY_SRC = unity/unity.c
 
 .PHONY: all test clean
 
 all: test
 
-$(BIN): $(SRCS)
-	mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SRCS) -o $(BIN)
+# --- pipeline sanity check ---
+TRIVIAL_BIN = $(BUILD_DIR)/test_trivial
+TRIVIAL_SRCS = $(UNITY_SRC) test_trivial.c
 
-test: $(BIN)
-	./$(BIN)
+$(TRIVIAL_BIN): $(TRIVIAL_SRCS)
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TRIVIAL_SRCS) -o $@
+
+# --- print_job_fsm ---
+PRINT_JOB_FSM_DIR = $(COMPONENTS_DIR)/print_job_fsm
+PRINT_JOB_FSM_BIN = $(BUILD_DIR)/test_print_job_fsm
+PRINT_JOB_FSM_SRCS = $(UNITY_SRC) $(PRINT_JOB_FSM_DIR)/print_job_fsm.c test_print_job_fsm.c
+
+$(PRINT_JOB_FSM_BIN): $(PRINT_JOB_FSM_SRCS)
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(PRINT_JOB_FSM_DIR)/include $(PRINT_JOB_FSM_SRCS) -o $@
+
+BINARIES = $(TRIVIAL_BIN) $(PRINT_JOB_FSM_BIN)
+
+test: $(BINARIES)
+	@for bin in $(BINARIES); do \
+		echo "== $$bin =="; \
+		./$$bin || exit 1; \
+	done
 
 clean:
 	rm -rf $(BUILD_DIR)
