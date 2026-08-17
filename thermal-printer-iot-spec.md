@@ -207,6 +207,31 @@ moving to the next.
       matching physical receipt prints; send two messages back-to-back and
       confirm both print, in order.
 
+## Future / Stretch Milestones (explicitly out of scope for this repo's M1–M10)
+
+Not part of the current milestone chain — captured here so it isn't lost,
+not to be picked up before M10 is done.
+
+11. **Verify TM-H2000 QR/image command support** — check the printer's
+    ESC/POS command reference for native QR support (`GS ( k`). If
+    present, printing a QR is trivial (printer does the encoding). If
+    absent, everything below is needed instead.
+    - *Acceptance:* documented answer, printer's actual command set
+      confirmed against a reference, not assumed.
+
+12. **QR encoder (pure logic, only if M11 finds no native support)** —
+    text in, pixel bitmap out. Good candidate for its own host-testable
+    component (`qr_encoder`), validated against known QR test vectors,
+    same pattern as the existing pure-logic components.
+
+13. **Raster image printing (ESC/POS formatter extension)** — extend
+    `escpos_formatter` to accept a bitmap and emit raster bit-image
+    commands (`GS v 0`) rather than only text bytes.
+
+14. **End-to-end: QR/image → physical print** — wire M12/M13 (or the
+    native command from M11) into the existing print job queue, same
+    integration shape as M10.
+
 ## Explicit Non-Goals for This Repo
 
 - No custom mobile app or PWA — use a generic BLE tool (nRF Connect /
@@ -215,6 +240,8 @@ moving to the next.
 - No OTA firmware updates
 - No power-sharing/buck-converter firmware concerns — that's hardware, not
   in scope here
+- No images, QR codes, or other non-text printing — M5's formatter is
+  text-only; see Future/Stretch Milestones above
 
 ## .gitignore
 
