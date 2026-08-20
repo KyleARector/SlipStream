@@ -19,3 +19,8 @@ test/host/build/
 *.o
 *.gcno
 *.gcda
+
+# Python virtualenvs (e.g. for tools/test_printer.py)
+test_env/
+.venv/
+venv/
