@@ -5,7 +5,9 @@
 #include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "escpos_formatter.h"
+#include "print_job_fsm.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_helpers.h"
@@ -16,6 +18,24 @@
 #define HOST_LIB_TASK_STACK_SIZE 4096
 #define ENUM_TASK_STACK_SIZE     (5 * 1024)
 #define MAX_TRACKED_DEVICES      8
+#define CLIENT_EVENT_POLL_MS     100
+#define INCOMING_JOB_QUEUE_LEN   PRINT_JOB_QUEUE_CAPACITY
+
+/* M8 queue demo: set to 1 to enqueue 3 hardcoded messages once the printer
+ * is ready, proving the queue drains multiple jobs in order. Off by
+ * default so plugging in the printer or rebooting during normal
+ * development doesn't print (and cut!) every single time -- flip on when
+ * you actually want to re-validate the queue behavior, then back off. */
+#define ENABLE_QUEUE_DEMO 0
+
+/* Extra trailing feed lines purely so each print is visibly pushed past
+ * the tear bar -- not part of escpos_format()'s tested output. */
+#define PRINT_EXTRA_FEED_LINES 8
+
+/* GS V 0 -- full cut. Not part of escpos_format()'s tested output;
+ * appended here per job as a separate, deliberate addition. */
+#define ESCPOS_CUT_FULL_LEN 3
+static const uint8_t k_escpos_cut_full[ESCPOS_CUT_FULL_LEN] = {0x1D, 0x56, 0x00};
 
 static const char *TAG = "usb_printer_host";
 
@@ -24,24 +44,7 @@ typedef enum {
     DEVICE_ACTION_GET_DEV_DESC    = (1 << 1),
     DEVICE_ACTION_GET_CONFIG_DESC = (1 << 2),
     DEVICE_ACTION_CLOSE           = (1 << 3),
-    DEVICE_ACTION_PRINT_TEST      = (1 << 4),
 } device_action_t;
-
-/* M7 scope: print one hardcoded string to prove the formatter + USB host
- * path work end to end. Extra trailing feed lines are appended purely so
- * the print is visibly pushed past the tear bar -- not part of
- * escpos_format()'s tested output (that stays exactly init + text + one
- * line feed, per M5). */
-#define PRINT_TEST_TEXT             "Hello from SlipStream!"
-#define PRINT_TEST_EXTRA_FEED_LINES 8
-
-/* GS V 0 -- full cut. Cut-command support is unconfirmed against the
- * physical printer per the spec's open item -- sending this from the
- * ESP32 (not just the earlier Mac-side script) is itself part of
- * confirming it. Deliberately NOT part of escpos_format()'s tested
- * output; appended here as a separate, experimental addition. */
-#define ESCPOS_CUT_FULL_LEN 3
-static const uint8_t k_escpos_cut_full[ESCPOS_CUT_FULL_LEN] = {0x1D, 0x56, 0x00};
 
 typedef struct {
     bool in_use;
@@ -50,14 +53,34 @@ typedef struct {
     uint8_t pending_actions;
 } tracked_device_t;
 
+/* Message handed off from any other task into the print job queue via a
+ * FreeRTOS queue. Per the spec's Concurrency Model, nothing outside
+ * enum_task ever touches print_job_queue_t/print_job_fsm_t directly --
+ * everyone else goes through usb_printer_host_enqueue_print(). */
+typedef struct {
+    char text[PRINT_JOB_TEXT_MAX_LEN];
+    size_t text_len;
+} incoming_job_msg_t;
+
 typedef struct {
     usb_host_client_handle_t client_hdl;
     SemaphoreHandle_t lock; /* protects devices[] and has_unhandled */
     tracked_device_t devices[MAX_TRACKED_DEVICES];
     bool has_unhandled;
+
+    /* The one printer this driver knows how to talk to right now. Owned
+     * solely by enum_task, same as the print job FSM/queue below. */
+    bool printer_ready;
+    usb_device_handle_t printer_dev_hdl;
+    uint8_t printer_bulk_out_ep;
+
+    /* Owned solely by enum_task -- see the spec's Concurrency Model. */
+    print_job_fsm_t print_fsm;
+    print_job_queue_t print_queue;
 } enum_driver_t;
 
 static enum_driver_t s_driver;
+static QueueHandle_t s_incoming_jobs;
 
 /* --- device action handlers: run only from enum_task, never from inside
  * the client event callback (USB Host Library functions must not be
@@ -87,22 +110,9 @@ static void action_get_dev_desc(tracked_device_t *dev)
     dev->pending_actions |= DEVICE_ACTION_GET_CONFIG_DESC;
 }
 
-static void action_get_config_desc(tracked_device_t *dev)
-{
-    const usb_config_desc_t *desc;
-    esp_err_t err = usb_host_get_active_config_descriptor(dev->dev_hdl, &desc);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get config descriptor: %s", esp_err_to_name(err));
-        return;
-    }
-    ESP_LOGI(TAG, "Device interface count: %d", desc->bNumInterfaces);
-    usb_print_config_descriptor(desc, NULL);
-    dev->pending_actions |= DEVICE_ACTION_PRINT_TEST;
-}
-
 /* Finds the first bulk OUT endpoint on interface 0, alt setting 0. Devices
- * with no bulk OUT endpoint (e.g. the hub itself, when one sits between us
- * and the printer) simply don't get a print attempt. */
+ * with no bulk OUT endpoint (e.g. a hub sitting in the path) just aren't
+ * treated as the printer. */
 static bool find_bulk_out_endpoint(const usb_config_desc_t *config_desc, uint8_t *out_ep_addr)
 {
     int offset = 0;
@@ -126,103 +136,53 @@ static bool find_bulk_out_endpoint(const usb_config_desc_t *config_desc, uint8_t
     return false;
 }
 
-/* Runs once the print transfer completes (or fails); never called from
- * inside the client event callback, only from usb_host_client_handle_events()
- * further down the enum_task loop -- see the submit-and-return note below.
- *
- * Deliberately does NOT release the claimed interface here: the driver
- * doesn't consider the endpoint's URB fully retired until just after this
- * callback returns, so releasing inline can silently fail with
- * ESP_ERR_INVALID_STATE (interface_release() checks num_urb_inflight).
- * The interface stays claimed until action_close() releases it right
- * before closing the device -- same release-then-close ordering IDF's own
- * async host tests use, just deferred to actual disconnect instead of
- * happening inline after each transfer. */
-static void print_transfer_done_cb(usb_transfer_t *transfer)
+static void action_get_config_desc(tracked_device_t *dev)
 {
-    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        ESP_LOGI(TAG, "Print job sent (%d bytes)", transfer->actual_num_bytes);
-    } else {
-        ESP_LOGE(TAG, "Print transfer failed, status=%d", transfer->status);
-    }
-
-    usb_host_transfer_free(transfer);
-}
-
-/* Formats and submits one hardcoded print job. Submits and returns
- * immediately -- must NOT block waiting for print_transfer_done_cb, since
- * that callback only fires from within usb_host_client_handle_events(),
- * which this same task calls later in its own loop. Blocking here would
- * deadlock the task against itself. */
-static void action_print_test(tracked_device_t *dev)
-{
-    const usb_config_desc_t *config_desc;
-    esp_err_t err = usb_host_get_active_config_descriptor(dev->dev_hdl, &config_desc);
+    const usb_config_desc_t *desc;
+    esp_err_t err = usb_host_get_active_config_descriptor(dev->dev_hdl, &desc);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get config descriptor for print test: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Failed to get config descriptor: %s", esp_err_to_name(err));
         return;
     }
+    ESP_LOGI(TAG, "Device interface count: %d", desc->bNumInterfaces);
+    usb_print_config_descriptor(desc, NULL);
 
     uint8_t ep_addr;
-    if (!find_bulk_out_endpoint(config_desc, &ep_addr)) {
-        ESP_LOGI(TAG, "No bulk OUT endpoint on device %d, skipping print test", dev->dev_addr);
+    if (!find_bulk_out_endpoint(desc, &ep_addr)) {
+        ESP_LOGI(TAG, "No bulk OUT endpoint on device %d, not treating it as the printer", dev->dev_addr);
         return;
     }
 
     err = usb_host_interface_claim(s_driver.client_hdl, dev->dev_hdl, 0, 0);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to claim interface for print test: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Failed to claim interface: %s", esp_err_to_name(err));
         return;
     }
 
-    static const char k_text[] = PRINT_TEST_TEXT;
-    uint8_t frame[ESCPOS_FRAME_OVERHEAD_LEN + sizeof(k_text) - 1 + PRINT_TEST_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN];
+    s_driver.printer_dev_hdl = dev->dev_hdl;
+    s_driver.printer_bulk_out_ep = ep_addr;
+    s_driver.printer_ready = true;
+    ESP_LOGI(TAG, "Printer ready (bulk OUT endpoint 0x%02X)", ep_addr);
 
-    size_t frame_len = escpos_format(k_text, sizeof(k_text) - 1, frame, sizeof(frame));
-    if (frame_len == 0) {
-        ESP_LOGE(TAG, "escpos_format() failed to produce output");
-        usb_host_interface_release(s_driver.client_hdl, dev->dev_hdl, 0);
-        return;
-    }
-
-    for (int i = 0; i < PRINT_TEST_EXTRA_FEED_LINES; i++) {
-        frame[frame_len++] = '\n';
-    }
-
-    memcpy(&frame[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
-    frame_len += ESCPOS_CUT_FULL_LEN;
-    ESP_LOGI(TAG, "Print job includes a full cut command -- watch the printer");
-
-    usb_transfer_t *transfer = NULL;
-    err = usb_host_transfer_alloc(frame_len, 0, &transfer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to allocate print transfer: %s", esp_err_to_name(err));
-        usb_host_interface_release(s_driver.client_hdl, dev->dev_hdl, 0);
-        return;
-    }
-
-    memcpy(transfer->data_buffer, frame, frame_len);
-    transfer->num_bytes = (int)frame_len;
-    transfer->device_handle = dev->dev_hdl;
-    transfer->bEndpointAddress = ep_addr;
-    transfer->callback = print_transfer_done_cb;
-
-    err = usb_host_transfer_submit(transfer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to submit print transfer: %s", esp_err_to_name(err));
-        usb_host_transfer_free(transfer);
-        usb_host_interface_release(s_driver.client_hdl, dev->dev_hdl, 0);
-    }
+#if ENABLE_QUEUE_DEMO
+    usb_printer_host_enqueue_print("Job 1 of 3", 10);
+    usb_printer_host_enqueue_print("Job 2 of 3", 10);
+    usb_printer_host_enqueue_print("Job 3 of 3", 10);
+#endif
 }
 
 static void action_close(tracked_device_t *dev)
 {
     ESP_LOGI(TAG, "Device disconnected (was address %d)", dev->dev_addr);
     if (dev->dev_hdl != NULL) {
+        if (s_driver.printer_ready && s_driver.printer_dev_hdl == dev->dev_hdl) {
+            s_driver.printer_ready = false;
+            s_driver.printer_dev_hdl = NULL;
+        }
+
         /* Release before close, matching IDF's own async host examples.
          * ESP_ERR_NOT_FOUND just means this device never had interface 0
-         * claimed (e.g. it had no bulk OUT endpoint, so action_print_test()
-         * skipped it) -- not a real failure. */
+         * claimed (e.g. it had no bulk OUT endpoint) -- not a real failure. */
         esp_err_t err = usb_host_interface_release(s_driver.client_hdl, dev->dev_hdl, 0);
         if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
             ESP_LOGW(TAG, "Failed to release interface: %s", esp_err_to_name(err));
@@ -250,9 +210,6 @@ static void handle_device_actions(tracked_device_t *dev)
         }
         if (actions & DEVICE_ACTION_GET_CONFIG_DESC) {
             action_get_config_desc(dev);
-        }
-        if (actions & DEVICE_ACTION_PRINT_TEST) {
-            action_print_test(dev);
         }
         if (actions & DEVICE_ACTION_CLOSE) {
             action_close(dev);
@@ -308,6 +265,117 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
     xSemaphoreGive(s_driver.lock);
 }
 
+/* --- print job processing: all of this runs only on enum_task, which is
+ * the single owning task for print_fsm/print_queue per the spec's
+ * Concurrency Model. --- */
+
+static void print_job_transfer_done_cb(usb_transfer_t *transfer)
+{
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        ESP_LOGI(TAG, "Print job sent (%d bytes)", transfer->actual_num_bytes);
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_SENT);
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_PRINTED);
+    } else {
+        ESP_LOGE(TAG, "Print transfer failed, status=%d", transfer->status);
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+    }
+    /* Deliberately does not release the interface here -- see action_close()
+     * for why (num_urb_inflight isn't cleared until just after this callback
+     * returns, so interface_release() can silently fail if called inline). */
+    usb_host_transfer_free(transfer);
+}
+
+static void start_next_print_job(void)
+{
+    print_job_t job;
+    if (!print_job_queue_pop(&s_driver.print_queue, &job)) {
+        return;
+    }
+
+    print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_START);
+
+    uint8_t frame[ESCPOS_FRAME_OVERHEAD_LEN + job.text_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN];
+    size_t frame_len = escpos_format(job.text, job.text_len, frame, sizeof(frame));
+    if (frame_len == 0) {
+        ESP_LOGE(TAG, "escpos_format() failed to produce output for queued job");
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+        return;
+    }
+    print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
+
+    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+        frame[frame_len++] = '\n';
+    }
+    memcpy(&frame[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+    frame_len += ESCPOS_CUT_FULL_LEN;
+
+    usb_transfer_t *transfer = NULL;
+    esp_err_t err = usb_host_transfer_alloc(frame_len, 0, &transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to allocate print transfer: %s", esp_err_to_name(err));
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+        return;
+    }
+
+    memcpy(transfer->data_buffer, frame, frame_len);
+    transfer->num_bytes = (int)frame_len;
+    transfer->device_handle = s_driver.printer_dev_hdl;
+    transfer->bEndpointAddress = s_driver.printer_bulk_out_ep;
+    transfer->callback = print_job_transfer_done_cb;
+
+    err = usb_host_transfer_submit(transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to submit print transfer: %s", esp_err_to_name(err));
+        usb_host_transfer_free(transfer);
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+    }
+}
+
+/* Drains anything handed off via usb_printer_host_enqueue_print() into the
+ * pure-logic queue. Only enum_task ever calls print_job_queue_push(). */
+static void drain_incoming_jobs(void)
+{
+    incoming_job_msg_t msg;
+    while (xQueueReceive(s_incoming_jobs, &msg, 0) == pdTRUE) {
+        if (!print_job_queue_push(&s_driver.print_queue, msg.text, msg.text_len)) {
+            ESP_LOGW(TAG, "Print job queue full, dropping job: %.*s", (int)msg.text_len, msg.text);
+        }
+    }
+}
+
+/* Advances the print job FSM: observes a finished/errored job, resets it,
+ * then starts the next queued job once the printer is ready and idle. */
+static void service_print_queue(void)
+{
+    print_job_state_t state = print_job_fsm_get_state(&s_driver.print_fsm);
+
+    if (state == PRINT_JOB_STATE_COMPLETE || state == PRINT_JOB_STATE_ERROR) {
+        ESP_LOGI(TAG, "Print job cycle %s, resetting", state == PRINT_JOB_STATE_COMPLETE ? "complete" : "errored");
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_RESET);
+        state = PRINT_JOB_STATE_IDLE;
+    }
+
+    if (state == PRINT_JOB_STATE_IDLE && s_driver.printer_ready && !print_job_queue_is_empty(&s_driver.print_queue)) {
+        start_next_print_job();
+    }
+}
+
+esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
+{
+    if (text == NULL || text_len >= PRINT_JOB_TEXT_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    incoming_job_msg_t msg;
+    memcpy(msg.text, text, text_len);
+    msg.text_len = text_len;
+
+    if (xQueueSend(s_incoming_jobs, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
 static void enum_task(void *arg)
 {
     (void)arg;
@@ -318,6 +386,9 @@ static void enum_task(void *arg)
         vTaskSuspend(NULL);
         return;
     }
+
+    print_job_fsm_init(&s_driver.print_fsm);
+    print_job_queue_init(&s_driver.print_queue);
 
     usb_host_client_config_t client_config = {
         .is_synchronous = false,
@@ -331,6 +402,9 @@ static void enum_task(void *arg)
     ESP_LOGI(TAG, "USB client registered, waiting for devices");
 
     while (1) {
+        drain_incoming_jobs();
+        service_print_queue();
+
         bool unhandled;
         xSemaphoreTake(s_driver.lock, portMAX_DELAY);
         unhandled = s_driver.has_unhandled;
@@ -346,7 +420,10 @@ static void enum_task(void *arg)
             s_driver.has_unhandled = false;
             xSemaphoreGive(s_driver.lock);
         } else {
-            usb_host_client_handle_events(s_driver.client_hdl, portMAX_DELAY);
+            /* Bounded, not portMAX_DELAY: this loop also has to come back
+             * around regularly to drain incoming print jobs and service the
+             * print queue even when no USB client event is pending. */
+            usb_host_client_handle_events(s_driver.client_hdl, pdMS_TO_TICKS(CLIENT_EVENT_POLL_MS));
         }
     }
 }
@@ -377,6 +454,11 @@ static void host_lib_task(void *arg)
 esp_err_t usb_printer_host_start(void)
 {
     memset(&s_driver, 0, sizeof(s_driver));
+
+    s_incoming_jobs = xQueueCreate(INCOMING_JOB_QUEUE_LEN, sizeof(incoming_job_msg_t));
+    if (s_incoming_jobs == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     TaskHandle_t host_lib_task_hdl = NULL;
     BaseType_t created = xTaskCreatePinnedToCore(host_lib_task, "usb_host_lib", HOST_LIB_TASK_STACK_SIZE,
