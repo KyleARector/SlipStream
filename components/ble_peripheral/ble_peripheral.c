@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "led_strip_encoder.h"
 #include "nvs_flash.h"
+#include "usb_printer_host.h"
 
 /* BLE */
 #include "host/ble_hs.h"
@@ -130,6 +131,14 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble
     }
 
     ESP_LOGI(TAG, "BLE write received (%u bytes): %.*s", len, (int)len, buf);
+
+    /* Safe to call from any task -- usb_printer_host_enqueue_print() hands
+     * off via its own FreeRTOS queue rather than touching the print job
+     * FSM/queue directly (see M8's Concurrency Model note). */
+    esp_err_t print_err = usb_printer_host_enqueue_print((const char *)buf, len);
+    if (print_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to enqueue print job: %s", esp_err_to_name(print_err));
+    }
 
     ble_periph_evt_t evt = BLE_PERIPH_EVT_WRITE_RECEIVED;
     xQueueSend(s_ble_events, &evt, 0);
