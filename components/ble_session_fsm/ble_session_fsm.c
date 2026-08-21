@@ -35,7 +35,7 @@ static ble_session_state_t next_state(ble_session_state_t state, ble_session_eve
     case BLE_SESSION_STATE_RECEIVING:
         if (event == BLE_SESSION_EVENT_RECEIVE_COMPLETE) {
             *ok = true;
-            return BLE_SESSION_STATE_IDLE;
+            return BLE_SESSION_STATE_CONNECTED;
         }
         break;
     }

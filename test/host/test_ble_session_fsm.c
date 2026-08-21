@@ -30,7 +30,30 @@ static void test_fsm_full_legal_lifecycle(void)
     TEST_ASSERT_EQUAL_INT(BLE_SESSION_STATE_RECEIVING, ble_session_fsm_get_state(&fsm));
 
     TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_RECEIVE_COMPLETE));
+    TEST_ASSERT_EQUAL_INT(BLE_SESSION_STATE_CONNECTED, ble_session_fsm_get_state(&fsm));
+
+    TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_TIMEOUT));
     TEST_ASSERT_EQUAL_INT(BLE_SESSION_STATE_IDLE, ble_session_fsm_get_state(&fsm));
+}
+
+/* A single BLE connection must be able to receive multiple messages in a
+ * row without dropping back to IDLE between them -- that's the whole
+ * reason RECEIVING lands back on CONNECTED rather than IDLE. */
+static void test_fsm_multiple_messages_on_one_connection(void)
+{
+    ble_session_fsm_t fsm;
+    ble_session_fsm_init(&fsm);
+
+    TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_BUTTON_PRESS));
+    TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_PEER_CONNECTED));
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_RECEIVE_START));
+        TEST_ASSERT_EQUAL_INT(BLE_SESSION_STATE_RECEIVING, ble_session_fsm_get_state(&fsm));
+
+        TEST_ASSERT_TRUE(ble_session_fsm_handle_event(&fsm, BLE_SESSION_EVENT_RECEIVE_COMPLETE));
+        TEST_ASSERT_EQUAL_INT(BLE_SESSION_STATE_CONNECTED, ble_session_fsm_get_state(&fsm));
+    }
 }
 
 /* ---- timeout paths ---- */
@@ -68,7 +91,7 @@ static void test_fsm_timeout_from_connected(void)
  *   ADVERTISING --TIMEOUT-->           IDLE
  *   CONNECTED   --RECEIVE_START-->     RECEIVING
  *   CONNECTED   --TIMEOUT-->           IDLE
- *   RECEIVING   --RECEIVE_COMPLETE-->  IDLE
+ *   RECEIVING   --RECEIVE_COMPLETE-->  CONNECTED
  * Every other (state, event) pair must be rejected as a no-op.
  */
 
@@ -108,7 +131,7 @@ static int legal_next_state(ble_session_state_t state, ble_session_event_t event
         return BLE_SESSION_STATE_IDLE;
     }
     if (state == BLE_SESSION_STATE_RECEIVING && event == BLE_SESSION_EVENT_RECEIVE_COMPLETE) {
-        return BLE_SESSION_STATE_IDLE;
+        return BLE_SESSION_STATE_CONNECTED;
     }
     return -1;
 }
@@ -156,6 +179,7 @@ int main(void)
 
     RUN_TEST(test_fsm_init_state_is_idle);
     RUN_TEST(test_fsm_full_legal_lifecycle);
+    RUN_TEST(test_fsm_multiple_messages_on_one_connection);
     RUN_TEST(test_fsm_timeout_from_advertising);
     RUN_TEST(test_fsm_timeout_from_connected);
     RUN_TEST(test_fsm_exhaustive_transition_matrix);

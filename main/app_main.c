@@ -1,6 +1,7 @@
 #include "esp_idf_version.h"
 #include "esp_log.h"
 
+#include "ble_peripheral.h"
 #include "usb_printer_host.h"
 
 static const char *TAG = "slipstream";
@@ -14,4 +15,5 @@ void app_main(void)
     ESP_LOGI(TAG, "================================================");
 
     ESP_ERROR_CHECK(usb_printer_host_start());
+    ESP_ERROR_CHECK(ble_peripheral_start());
 }
