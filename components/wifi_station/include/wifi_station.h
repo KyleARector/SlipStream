@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,14 @@ extern "C" {
  * Also kicks off SNTP time sync (see sntp_sync.h) as soon as an IP address
  * is obtained, and again on every subsequent reconnect. */
 esp_err_t wifi_sta_start(void);
+
+/* Blocks the calling task until WiFi has an IP, or until timeout ticks
+ * elapse (pass portMAX_DELAY to wait forever). Returns ESP_OK once
+ * connected, ESP_ERR_TIMEOUT on timeout, or ESP_ERR_INVALID_STATE if
+ * wifi_sta_start() never brought up the WiFi driver at all (no stored
+ * credentials). Safe to call from any task -- e.g. api_client (M21) uses
+ * this to defer its first poll until there's a network to poll over. */
+esp_err_t wifi_sta_wait_connected(TickType_t timeout);
 
 #ifdef __cplusplus
 }

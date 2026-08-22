@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -17,6 +19,15 @@ extern "C" {
  * first request -- some TLS stacks reject certificates as invalid while the
  * clock still reads its power-on default. */
 esp_err_t sntp_sync_start(void);
+
+/* True once at least one sync has completed (never clears back to false
+ * afterward, even across a later resync -- callers only need to know the
+ * clock became trustworthy at some point, not track every resync). Poll
+ * this with a short delay loop rather than blocking on it directly --
+ * esp_netif_sntp's own wait primitive uses a semaphore that's only
+ * re-signaled on each actual resync (which may be hours away), so a
+ * caller that consumes it once would hang on a second wait. */
+bool sntp_sync_has_synced(void);
 
 #ifdef __cplusplus
 }

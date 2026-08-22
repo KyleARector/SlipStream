@@ -27,11 +27,13 @@ around them.
   the existing BLE GATT write characteristic remains active — you can
   still BLE-write a message directly at any time, not just during
   provisioning.
-- **Firmware talks to the backend via HTTPS polling, not MQTT directly.**
-  The device periodically checks in with the server (see the
-  `slipstream-web` repo's API spec for the exact contract). MQTT is an
-  internal-only implementation detail of the backend; the firmware never
-  speaks it.
+- **Firmware talks to the backend via HTTPS polling.** The device
+  periodically checks in with the server (see the `slipstream-web`
+  repo's API spec for the exact contract). An earlier draft of that
+  spec considered MQTT/Mosquitto as an internal-only backend detail;
+  it's been dropped as unnecessary infrastructure, so there's no MQTT
+  anywhere in this system, backend included — this note stays only to
+  head off the earlier assumption.
 - **API credentials (server URL, API key) live in a gitignored
   `secrets.h`, compiled in at build time.** A checked-in
   `secrets.h.example` documents the required fields without exposing real
@@ -228,4 +230,5 @@ QR/image stretch milestones already scoped in the original spec)
   Item above)
 - Multi-device fleet management (this spec assumes one hand-provisioned
   device)
-- MQTT client code in the firmware — that stays server-side only
+- MQTT client code in the firmware — moot, since the backend doesn't
+  use MQTT either (see the confirmed decisions above)

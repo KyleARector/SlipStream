@@ -8,6 +8,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/event_groups.h"
 #include "sntp_sync.h"
 #include "wifi_creds.h"
 
@@ -15,9 +16,11 @@ static const char *TAG = "wifi_station";
 
 #define RETRY_BACKOFF_INITIAL_MS 1000
 #define RETRY_BACKOFF_MAX_MS     60000
+#define WIFI_CONNECTED_BIT       BIT0
 
 static esp_timer_handle_t s_retry_timer;
 static uint32_t s_retry_backoff_ms;
+static EventGroupHandle_t s_wifi_event_group;
 
 /* All touched only from the default esp_event loop task (the WIFI_EVENT/
  * IP_EVENT handler below, and the retry timer callback, which esp_timer
@@ -53,6 +56,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "WiFi disconnected");
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         schedule_retry();
         return;
     }
@@ -61,6 +65,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&evt->ip_info.ip));
         s_retry_backoff_ms = 0; /* reset so the next disconnect starts from the initial delay again */
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
         /* SNTP needs network connectivity, so this is the earliest point
          * to start it; it also re-syncs correctly on a later reconnect. */
@@ -79,6 +84,11 @@ esp_err_t wifi_sta_start(void)
     if (wifi_creds_get(ssid, sizeof(ssid), password, sizeof(password)) != ESP_OK) {
         ESP_LOGI(TAG, "No stored WiFi credentials -- staying BLE-only");
         return ESP_OK;
+    }
+
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -115,4 +125,16 @@ esp_err_t wifi_sta_start(void)
 
     ESP_LOGI(TAG, "WiFi station starting for SSID \"%s\"", ssid);
     return ESP_OK;
+}
+
+esp_err_t wifi_sta_wait_connected(TickType_t timeout)
+{
+    if (s_wifi_event_group == NULL) {
+        /* wifi_sta_start() never got past "no stored credentials" -- there's
+         * no WiFi to wait for. */
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, timeout);
+    return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
 }

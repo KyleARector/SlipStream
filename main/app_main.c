@@ -2,7 +2,9 @@
 #include "esp_idf_version.h"
 #include "esp_log.h"
 
+#include "api_client.h"
 #include "ble_peripheral.h"
+#include "secrets.h"
 #include "usb_printer_host.h"
 #include "wifi_station.h"
 
@@ -22,4 +24,5 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_printer_host_start());
     ESP_ERROR_CHECK(ble_peripheral_start());
     ESP_ERROR_CHECK(wifi_sta_start());
+    ESP_ERROR_CHECK(api_client_start(API_SERVER_URL, API_KEY));
 }

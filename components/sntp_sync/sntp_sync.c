@@ -8,16 +8,24 @@
 
 static const char *TAG = "sntp_sync";
 static bool s_initialized;
+static volatile bool s_synced;
 
 static void time_sync_notification_cb(struct timeval *tv)
 {
     (void)tv;
+    s_synced = true;
+
     time_t now = time(NULL);
     struct tm timeinfo;
     localtime_r(&now, &timeinfo);
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
     ESP_LOGI(TAG, "System time synced: %s UTC", buf);
+}
+
+bool sntp_sync_has_synced(void)
+{
+    return s_synced;
 }
 
 esp_err_t sntp_sync_start(void)
