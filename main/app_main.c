@@ -4,6 +4,7 @@
 
 #include "ble_peripheral.h"
 #include "usb_printer_host.h"
+#include "wifi_station.h"
 
 static const char *TAG = "slipstream";
 
@@ -20,4 +21,5 @@ void app_main(void)
 
     ESP_ERROR_CHECK(usb_printer_host_start());
     ESP_ERROR_CHECK(ble_peripheral_start());
+    ESP_ERROR_CHECK(wifi_sta_start());
 }

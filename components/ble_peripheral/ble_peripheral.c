@@ -13,6 +13,7 @@
 #include "led_strip_encoder.h"
 #include "nvs_flash.h"
 #include "usb_printer_host.h"
+#include "wifi_creds.h"
 
 /* BLE */
 #include "host/ble_hs.h"
@@ -50,14 +51,10 @@ void ble_store_config_init(void);
 
 /* WiFi credentials (M18): plain-write GATT characteristics, no delimiter
  * parsing -- SSID and password are separate characteristics. Persisted to
- * NVS; never compiled in. Bonding/encryption intentionally not required for
- * v1 (see Phase 2 spec's risk-acceptance decision). 63 bytes is WPA2-PSK's
- * max passphrase length; 32 is 802.11's max SSID length. */
-#define WIFI_SSID_MAX_LEN    32
-#define WIFI_PASSWORD_MAX_LEN 63
-#define WIFI_NVS_NAMESPACE   "wifi_creds"
-#define WIFI_NVS_KEY_SSID    "ssid"
-#define WIFI_NVS_KEY_PASSWORD "password"
+ * NVS via wifi_creds (shared with wifi_station, M19, so the NVS
+ * namespace/key names live in exactly one place); never compiled in.
+ * Bonding/encryption intentionally not required for v1 (see Phase 2 spec's
+ * risk-acceptance decision). */
 
 static const char *TAG = "ble_peripheral";
 
@@ -203,10 +200,10 @@ static int wifi_cred_write_cb(uint16_t conn_handle, uint16_t attr_handle, struct
     }
 
     const char *nvs_key = (const char *)arg;
-    bool is_ssid = (strcmp(nvs_key, WIFI_NVS_KEY_SSID) == 0);
-    size_t max_len = is_ssid ? WIFI_SSID_MAX_LEN : WIFI_PASSWORD_MAX_LEN;
+    bool is_ssid = (strcmp(nvs_key, WIFI_CREDS_KEY_SSID) == 0);
+    size_t max_len = is_ssid ? WIFI_CREDS_SSID_MAX_LEN : WIFI_CREDS_PASSWORD_MAX_LEN;
 
-    uint8_t buf[WIFI_PASSWORD_MAX_LEN + 1];
+    uint8_t buf[WIFI_CREDS_PASSWORD_MAX_LEN + 1];
     uint16_t len = 0;
     int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, max_len, &len);
     if (rc != 0) {
@@ -214,15 +211,7 @@ static int wifi_cred_write_cb(uint16_t conn_handle, uint16_t attr_handle, struct
     }
     buf[len] = '\0';
 
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = nvs_set_str(nvs, nvs_key, (const char *)buf);
-        if (err == ESP_OK) {
-            err = nvs_commit(nvs);
-        }
-        nvs_close(nvs);
-    }
+    esp_err_t err = wifi_creds_set(nvs_key, (const char *)buf);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to persist WiFi %s to NVS: %s", nvs_key, esp_err_to_name(err));
         return BLE_ATT_ERR_UNLIKELY;
@@ -260,14 +249,14 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 {
                     .uuid = &s_wifi_ssid_chr_uuid.u,
                     .access_cb = wifi_cred_write_cb,
-                    .arg = (void *)WIFI_NVS_KEY_SSID,
+                    .arg = (void *)WIFI_CREDS_KEY_SSID,
                     .flags = BLE_GATT_CHR_F_WRITE,
                     .val_handle = &s_wifi_ssid_chr_val_handle,
                 },
                 {
                     .uuid = &s_wifi_password_chr_uuid.u,
                     .access_cb = wifi_cred_write_cb,
-                    .arg = (void *)WIFI_NVS_KEY_PASSWORD,
+                    .arg = (void *)WIFI_CREDS_KEY_PASSWORD,
                     .flags = BLE_GATT_CHR_F_WRITE,
                     .val_handle = &s_wifi_password_chr_val_handle,
                 },
@@ -500,17 +489,17 @@ static void ble_peripheral_task(void *arg)
 static void log_stored_wifi_creds(void)
 {
     nvs_handle_t nvs;
-    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+    if (nvs_open(WIFI_CREDS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
         ESP_LOGI(TAG, "No stored WiFi credentials yet");
         return;
     }
 
-    char ssid[WIFI_SSID_MAX_LEN + 1];
+    char ssid[WIFI_CREDS_SSID_MAX_LEN + 1];
     size_t ssid_len = sizeof(ssid);
-    esp_err_t ssid_err = nvs_get_str(nvs, WIFI_NVS_KEY_SSID, ssid, &ssid_len);
+    esp_err_t ssid_err = nvs_get_str(nvs, WIFI_CREDS_KEY_SSID, ssid, &ssid_len);
 
     size_t pass_len = 0;
-    esp_err_t pass_err = nvs_get_str(nvs, WIFI_NVS_KEY_PASSWORD, NULL, &pass_len);
+    esp_err_t pass_err = nvs_get_str(nvs, WIFI_CREDS_KEY_PASSWORD, NULL, &pass_len);
 
     nvs_close(nvs);
 
