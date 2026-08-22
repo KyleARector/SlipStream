@@ -282,19 +282,39 @@ static void do_check_and_apply(const char *server_url, const char *api_key, cons
 
 /* Version strings are compared as opaque strings (no semver logic, matching
  * slipstream-web's own "latest is whichever was published most recently"
- * philosophy) -- but an optional leading 'v'/'V' is stripped from both
- * sides first. Without this, "v0.1.1" (this device's git-tag-derived
- * running version) and "0.1.1" (however a version happens to get typed
- * into a publish command) compare as different strings forever, and the
- * device re-downloads and reflashes its own already-current image on every
- * single check-in indefinitely -- confirmed on real hardware, not a
- * hypothetical. */
-static const char *skip_v_prefix(const char *version)
+ * philosophy), but normalized first:
+ *
+ *   - An optional leading 'v'/'V' is stripped. Without this, "v0.1.1"
+ *     (this device's git-tag-derived running version) and "0.1.1"
+ *     (however a version happens to get typed into a publish command)
+ *     compare as different strings forever, and the device re-downloads
+ *     and reflashes its own already-current image on every single
+ *     check-in indefinitely -- confirmed on real hardware, not a
+ *     hypothetical.
+ *   - Everything from the first '-' onward is dropped. `git describe`
+ *     appends "-<N>-g<hash>" when the build isn't exactly on a tag (plus
+ *     "-dirty" if the tree has uncommitted changes), e.g.
+ *     "v0.1.3-1-gabd25c2" for a dev build one commit past the v0.1.3 tag.
+ *     Treating that as equivalent to "v0.1.3" matches how tags actually
+ *     get used here (marking a milestone, then developing on top of it) --
+ *     otherwise every ordinary dev build's version differs from whatever
+ *     is currently published, and the device silently reflashes itself
+ *     back to the published tag within one poll interval, discarding
+ *     whatever was just wired-flashed to test -- also confirmed on real
+ *     hardware. Tags in this project are always plain "vX.Y.Z" with no
+ *     embedded hyphens, so truncating at the first '-' is unambiguous. */
+static void normalize_version(const char *version, char *out, size_t out_cap)
 {
     if ((version[0] == 'v' || version[0] == 'V') && version[1] != '\0') {
-        return version + 1;
+        version++;
     }
-    return version;
+
+    size_t len = 0;
+    while (version[len] != '\0' && version[len] != '-' && len + 1 < out_cap) {
+        len++;
+    }
+    memcpy(out, version, len);
+    out[len] = '\0';
 }
 
 /* Heap-owned copy of the strings the OTA task needs -- api_client's own
@@ -317,7 +337,12 @@ static void ota_task_entry(void *arg)
 void ota_update_check_and_apply(const char *server_url, const char *api_key, const char *latest_version)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    if (strcmp(skip_v_prefix(latest_version), skip_v_prefix(app_desc->version)) == 0) {
+
+    char normalized_latest[32];
+    char normalized_running[32];
+    normalize_version(latest_version, normalized_latest, sizeof(normalized_latest));
+    normalize_version(app_desc->version, normalized_running, sizeof(normalized_running));
+    if (strcmp(normalized_latest, normalized_running) == 0) {
         return;
     }
 
