@@ -24,3 +24,7 @@ test/host/build/
 test_env/
 .venv/
 venv/
+
+# API credentials (server URL, API key) -- compiled in at build time.
+# Copy main/secrets.h.example to main/secrets.h and fill in real values.
+main/secrets.h
