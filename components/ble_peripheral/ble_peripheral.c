@@ -48,6 +48,17 @@ void ble_store_config_init(void);
 #define BLE_DEVICE_NAME        "SlipStream"
 #define BLE_WRITE_CHAR_MAX_LEN 256
 
+/* WiFi credentials (M18): plain-write GATT characteristics, no delimiter
+ * parsing -- SSID and password are separate characteristics. Persisted to
+ * NVS; never compiled in. Bonding/encryption intentionally not required for
+ * v1 (see Phase 2 spec's risk-acceptance decision). 63 bytes is WPA2-PSK's
+ * max passphrase length; 32 is 802.11's max SSID length. */
+#define WIFI_SSID_MAX_LEN    32
+#define WIFI_PASSWORD_MAX_LEN 63
+#define WIFI_NVS_NAMESPACE   "wifi_creds"
+#define WIFI_NVS_KEY_SSID    "ssid"
+#define WIFI_NVS_KEY_PASSWORD "password"
+
 static const char *TAG = "ble_peripheral";
 
 /* --- onboard RGB LED (WS2812B over RMT) --- */
@@ -112,6 +123,18 @@ static const ble_uuid128_t s_version_chr_uuid =
                       0x6d, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00);
 static uint16_t s_version_chr_val_handle;
 
+/* Write-only WiFi credential characteristics (M18). Share one access
+ * callback, distinguished by the NVS key passed in via each
+ * ble_gatt_chr_def's .arg. */
+static const ble_uuid128_t s_wifi_ssid_chr_uuid =
+    BLE_UUID128_INIT(0x51, 0x49, 0x50, 0x53, 0x74, 0x72, 0x65, 0x61,
+                      0x6d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00);
+static uint16_t s_wifi_ssid_chr_val_handle;
+static const ble_uuid128_t s_wifi_password_chr_uuid =
+    BLE_UUID128_INIT(0x51, 0x49, 0x50, 0x53, 0x74, 0x72, 0x65, 0x61,
+                      0x6d, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00);
+static uint16_t s_wifi_password_chr_val_handle;
+
 /* Events handed from the NimBLE host task (GAP/GATT callbacks) to
  * ble_peripheral_task, which is the single task that owns ble_session_fsm
  * -- same discipline the spec's Concurrency Model requires for the print
@@ -170,6 +193,52 @@ static int version_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle, str
     return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
+static int wifi_cred_write_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    const char *nvs_key = (const char *)arg;
+    bool is_ssid = (strcmp(nvs_key, WIFI_NVS_KEY_SSID) == 0);
+    size_t max_len = is_ssid ? WIFI_SSID_MAX_LEN : WIFI_PASSWORD_MAX_LEN;
+
+    uint8_t buf[WIFI_PASSWORD_MAX_LEN + 1];
+    uint16_t len = 0;
+    int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, max_len, &len);
+    if (rc != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    buf[len] = '\0';
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, nvs_key, (const char *)buf);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist WiFi %s to NVS: %s", nvs_key, esp_err_to_name(err));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    /* SSID is fine to log verbatim (matches the existing message-write log);
+     * the password is never logged, only its byte count. */
+    if (is_ssid) {
+        ESP_LOGI(TAG, "WiFi SSID stored (%u bytes): %s", len, buf);
+    } else {
+        ESP_LOGI(TAG, "WiFi password stored (%u bytes)", len);
+    }
+
+    return 0;
+}
+
 static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -187,6 +256,20 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                     .access_cb = version_chr_access_cb,
                     .flags = BLE_GATT_CHR_F_READ,
                     .val_handle = &s_version_chr_val_handle,
+                },
+                {
+                    .uuid = &s_wifi_ssid_chr_uuid.u,
+                    .access_cb = wifi_cred_write_cb,
+                    .arg = (void *)WIFI_NVS_KEY_SSID,
+                    .flags = BLE_GATT_CHR_F_WRITE,
+                    .val_handle = &s_wifi_ssid_chr_val_handle,
+                },
+                {
+                    .uuid = &s_wifi_password_chr_uuid.u,
+                    .access_cb = wifi_cred_write_cb,
+                    .arg = (void *)WIFI_NVS_KEY_PASSWORD,
+                    .flags = BLE_GATT_CHR_F_WRITE,
+                    .val_handle = &s_wifi_password_chr_val_handle,
                 },
                 {0},
             },
@@ -411,6 +494,34 @@ static void ble_peripheral_task(void *arg)
     }
 }
 
+/* Logged once at boot, after NVS is up, so persistence across a reboot is
+ * visible in the console without needing another BLE session. SSID is
+ * logged verbatim; the password's presence/length only, never its value. */
+static void log_stored_wifi_creds(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(TAG, "No stored WiFi credentials yet");
+        return;
+    }
+
+    char ssid[WIFI_SSID_MAX_LEN + 1];
+    size_t ssid_len = sizeof(ssid);
+    esp_err_t ssid_err = nvs_get_str(nvs, WIFI_NVS_KEY_SSID, ssid, &ssid_len);
+
+    size_t pass_len = 0;
+    esp_err_t pass_err = nvs_get_str(nvs, WIFI_NVS_KEY_PASSWORD, NULL, &pass_len);
+
+    nvs_close(nvs);
+
+    if (ssid_err == ESP_OK) {
+        ESP_LOGI(TAG, "Stored WiFi SSID: %s", ssid);
+    } else {
+        ESP_LOGI(TAG, "No stored WiFi SSID");
+    }
+    ESP_LOGI(TAG, "Stored WiFi password: %s", pass_err == ESP_OK ? "present" : "none");
+}
+
 esp_err_t ble_peripheral_start(void)
 {
     s_ble_events = xQueueCreate(8, sizeof(ble_periph_evt_t));
@@ -430,6 +541,8 @@ esp_err_t ble_peripheral_start(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    log_stored_wifi_creds();
 
     err = nimble_port_init();
     if (err != ESP_OK) {

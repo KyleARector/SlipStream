@@ -19,7 +19,12 @@ extern "C" {
  *
  * A second, read-only characteristic on the same service reports the
  * running firmware version (same string as the boot banner) -- readable at
- * any time, no pairing/hold required. */
+ * any time, no pairing/hold required.
+ *
+ * Two more write-only characteristics accept WiFi SSID and password
+ * separately (no delimiter parsing) and persist them to NVS immediately.
+ * No bonding/encryption is required to write them for v1 -- an accepted
+ * risk given the pairing button's physical-proximity requirement. */
 esp_err_t ble_peripheral_start(void);
 
 #ifdef __cplusplus
