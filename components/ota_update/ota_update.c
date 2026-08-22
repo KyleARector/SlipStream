@@ -280,6 +280,23 @@ static void do_check_and_apply(const char *server_url, const char *api_key, cons
     esp_restart();
 }
 
+/* Version strings are compared as opaque strings (no semver logic, matching
+ * slipstream-web's own "latest is whichever was published most recently"
+ * philosophy) -- but an optional leading 'v'/'V' is stripped from both
+ * sides first. Without this, "v0.1.1" (this device's git-tag-derived
+ * running version) and "0.1.1" (however a version happens to get typed
+ * into a publish command) compare as different strings forever, and the
+ * device re-downloads and reflashes its own already-current image on every
+ * single check-in indefinitely -- confirmed on real hardware, not a
+ * hypothetical. */
+static const char *skip_v_prefix(const char *version)
+{
+    if ((version[0] == 'v' || version[0] == 'V') && version[1] != '\0') {
+        return version + 1;
+    }
+    return version;
+}
+
 /* Heap-owned copy of the strings the OTA task needs -- api_client's own
  * buffers (s_response_buf, the parsed cJSON tree) don't outlive its call
  * into ota_update_check_and_apply(), and the OTA task outlives that call. */
@@ -300,7 +317,7 @@ static void ota_task_entry(void *arg)
 void ota_update_check_and_apply(const char *server_url, const char *api_key, const char *latest_version)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    if (strcmp(latest_version, app_desc->version) == 0) {
+    if (strcmp(skip_v_prefix(latest_version), skip_v_prefix(app_desc->version)) == 0) {
         return;
     }
 
