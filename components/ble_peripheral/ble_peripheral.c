@@ -5,6 +5,7 @@
 #include "ble_session_fsm.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -101,6 +102,16 @@ static const ble_uuid128_t s_chr_uuid =
                       0x6d, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00);
 static uint16_t s_chr_val_handle;
 
+/* Read-only firmware version characteristic (M16). Value is the same
+ * PROJECT_VER string logged in the boot banner -- IDF's build system
+ * populates it automatically from `git describe --always --tags --dirty`
+ * (see esp_app_format's CMakeLists.txt), so a git tag or new commit changes
+ * the reported version on rebuild with no manual editing here. */
+static const ble_uuid128_t s_version_chr_uuid =
+    BLE_UUID128_INIT(0x51, 0x49, 0x50, 0x53, 0x74, 0x72, 0x65, 0x61,
+                      0x6d, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00);
+static uint16_t s_version_chr_val_handle;
+
 /* Events handed from the NimBLE host task (GAP/GATT callbacks) to
  * ble_peripheral_task, which is the single task that owns ble_session_fsm
  * -- same discipline the spec's Concurrency Model requires for the print
@@ -145,6 +156,20 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble
     return 0;
 }
 
+static int version_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR || attr_handle != s_version_chr_val_handle) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    int rc = os_mbuf_append(ctxt->om, app_desc->version, strlen(app_desc->version));
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
 static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -156,6 +181,12 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                     .access_cb = gatt_access_cb,
                     .flags = BLE_GATT_CHR_F_WRITE,
                     .val_handle = &s_chr_val_handle,
+                },
+                {
+                    .uuid = &s_version_chr_uuid.u,
+                    .access_cb = version_chr_access_cb,
+                    .flags = BLE_GATT_CHR_F_READ,
+                    .val_handle = &s_version_chr_val_handle,
                 },
                 {0},
             },

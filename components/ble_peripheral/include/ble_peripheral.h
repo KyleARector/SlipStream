@@ -15,7 +15,11 @@ extern "C" {
  * times out after 30s with no connection, returning to IDLE (LED off); a
  * deliberate disconnect instead resumes advertising immediately. Driven
  * entirely by components/ble_session_fsm -- see that component for the
- * state machine itself. */
+ * state machine itself.
+ *
+ * A second, read-only characteristic on the same service reports the
+ * running firmware version (same string as the boot banner) -- readable at
+ * any time, no pairing/hold required. */
 esp_err_t ble_peripheral_start(void);
 
 #ifdef __cplusplus
