@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "ota_update.h"
 #include "sntp_sync.h"
 #include "usb_printer_host.h"
 #include "wifi_station.h"
@@ -39,6 +40,10 @@ static void handle_checkin_response(const char *json_str)
     cJSON *latest_version = cJSON_GetObjectItemCaseSensitive(root, "latest_firmware_version");
     if (cJSON_IsString(latest_version)) {
         ESP_LOGI(TAG, "Server reports latest firmware version: %s", latest_version->valuestring);
+        /* May reboot the device (esp_restart()) if a newer, validly-signed
+         * image is available and the print queue is idle -- see M22's
+         * ota_update component. Never returns in that case. */
+        ota_update_check_and_apply(s_server_url, s_api_key, latest_version->valuestring);
     }
 
     cJSON *job_array = cJSON_GetObjectItemCaseSensitive(root, "jobs");
@@ -120,6 +125,12 @@ static void do_checkin(void)
     s_response_buf[read_len] = '\0';
 
     ESP_LOGI(TAG, "Check-in OK (%d byte response)", read_len);
+
+    /* A successful check-in is exactly the "first successful post-update
+     * poll" signal M22's rollback-safety requirement depends on -- a no-op
+     * once the running image is already confirmed valid. */
+    ota_update_confirm_valid_if_pending();
+
     handle_checkin_response(s_response_buf);
 }
 

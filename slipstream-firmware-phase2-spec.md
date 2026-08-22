@@ -59,23 +59,32 @@ around them.
   Secure Boot v2/eFuse-based secure boot. Rollback-safety is required: a
   new image must self-validate (successful first poll) before being
   marked permanently bootable.
-- **OTA signature format (confirmed in `slipstream-web` M8 — firmware M22
-  must match exactly):** Ed25519, chosen over ECDSA/RSA for a fixed-size
-  (64-byte), DER-free signature — nothing to get wrong parsing ASN.1 on
-  the firmware side. The signed image the server hosts/serves is
-  `[original firmware bytes][64-byte Ed25519 signature]` — a single
-  trailing 64-byte footer, no length prefix needed since the signature
-  size is fixed for this algorithm. Firmware M22 must: strip the last 64
-  bytes as the signature, treat everything before that as the actual
-  image to flash, and verify the signature against that image using the
-  Ed25519 public key corresponding to the maintainer's private signing
-  key (`slipstream-web`'s `scripts/sign_firmware.py generate-key`) —
-  that public key needs to be embedded in firmware, e.g. compiled into
-  `secrets.h` or a dedicated constant, as a trusted-key decision this
-  spec doesn't currently cover and M22 should account for. mbedTLS as
-  shipped with ESP-IDF v5.5.x supports Ed25519 verification; no hardware
-  crypto acceleration needed since this is a one-time per-OTA-event
-  check, not a per-boot hot path.
+- **OTA signature format — corrected to ECDSA-P256, not Ed25519.** The
+  `slipstream-web` M8 signing CLI originally implemented Ed25519 (chosen
+  for its fixed-size, DER-free 64-byte signature). While scoping this
+  milestone, we confirmed ESP-IDF v5.5.5's bundled mbedTLS has **no
+  working Ed25519 verification** — PSA crypto declares
+  `PSA_ALG_PURE_EDDSA` in its headers but never wires up an
+  implementation (`psa_verify_message()` returns
+  `PSA_ERROR_NOT_SUPPORTED`); `everest` is X25519 (ECDH) only, not
+  Edwards25519 signing; `mbedtls_pk_verify()` supports only RSA/ECDSA.
+  IDF's own Secure Boot v2 uses ECDSA-P256/RSA-PSS for exactly this
+  reason. `mbedtls_pk_verify()` handles ECDSA's DER/ASN.1 parsing
+  internally, so switching ends up *less* firmware-side complexity than
+  Ed25519 would have needed (the "DER-free" rationale assumed Ed25519
+  verification was available on-device at all, which it isn't). No
+  signing keypair had been generated yet at the time of this correction,
+  so there's no migration cost.
+
+  The signed image format is still `[original firmware bytes][signature]`,
+  but unlike Ed25519's fixed 64 bytes, an ECDSA-P256 DER signature is
+  **variable-length** — the exact trailing format (e.g. a 2-byte
+  length-prefix immediately after the image, before the DER signature)
+  needs to be finalized jointly with `slipstream-web`'s M8 rework before
+  firmware M22 implements the strip-and-verify step. The public key
+  embedding location (a dedicated tracked constant, not `secrets.h` —
+  it's a verification anchor, not a secret) is settled; the key itself
+  still needs generating.
 - **OTA requires a one-time wired flash.** The current partition table
   (from Phase 1) doesn't have the dual-app-slot layout OTA needs — that
   layout can only be established via a wired flash, not OTA'd into

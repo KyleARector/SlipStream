@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "esp_err.h"
@@ -29,6 +30,15 @@ esp_err_t usb_printer_host_start(void);
  * Returns ESP_ERR_INVALID_ARG if text is NULL or text_len is too long for
  * a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */
 esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len);
+
+/* True when there's no incoming/queued/in-flight print job anywhere in the
+ * pipeline (the handoff queue, the pure-logic print_job_queue, and the FSM
+ * itself are all idle). A single volatile flag, computed and written only
+ * by enum_task (the sole owner of the print job FSM/queue per the spec's
+ * Concurrency Model) and safe for any other task to read -- e.g. ota_update
+ * (M22) uses this to defer flashing a downloaded image until there's no
+ * job that would be lost by a reboot. */
+bool usb_printer_host_queue_is_idle(void);
 
 #ifdef __cplusplus
 }

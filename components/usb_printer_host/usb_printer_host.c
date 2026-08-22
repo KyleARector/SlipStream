@@ -82,6 +82,12 @@ typedef struct {
 static enum_driver_t s_driver;
 static QueueHandle_t s_incoming_jobs;
 
+/* Written only by enum_task, once per loop iteration below; read from any
+ * task via usb_printer_host_queue_is_idle(). A single bool read/write is
+ * atomic on this architecture, so no lock is needed for this one derived
+ * flag even though print_queue/print_fsm themselves stay single-owner. */
+static volatile bool s_queue_idle = true;
+
 /* --- device action handlers: run only from enum_task, never from inside
  * the client event callback (USB Host Library functions must not be
  * called re-entrantly from that callback's context). --- */
@@ -358,6 +364,18 @@ static void service_print_queue(void)
     if (state == PRINT_JOB_STATE_IDLE && s_driver.printer_ready && !print_job_queue_is_empty(&s_driver.print_queue)) {
         start_next_print_job();
     }
+
+    /* Re-fetch state rather than reuse the local above -- start_next_print_job()
+     * may have just transitioned the FSM out of IDLE, and this flag must never
+     * report idle for even one extra loop iteration while a job is in flight. */
+    s_queue_idle = (uxQueueMessagesWaiting(s_incoming_jobs) == 0) &&
+                   print_job_queue_is_empty(&s_driver.print_queue) &&
+                   print_job_fsm_get_state(&s_driver.print_fsm) == PRINT_JOB_STATE_IDLE;
+}
+
+bool usb_printer_host_queue_is_idle(void)
+{
+    return s_queue_idle;
 }
 
 esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
