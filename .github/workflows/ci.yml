@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stub secrets.h for build validation
+        run: cp main/secrets.h.example main/secrets.h
+
       - name: idf.py build (esp32s3)
         uses: espressif/esp-idf-ci-action@v1
         with:
