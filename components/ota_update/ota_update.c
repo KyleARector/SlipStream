@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_app_desc.h"
@@ -9,6 +10,8 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/sha256.h"
 #include "ota_trust_key.h"
@@ -16,6 +19,13 @@
 
 static const char *TAG = "ota_update";
 
+/* The download/verify pipeline (TLS handshake, esp_http_client, a 4KB
+ * chunk buffer, an mbedtls SHA-256 context) runs on its own dedicated task
+ * with a generously-sized stack -- it must never run nested inside
+ * api_client's call stack (api_client's task is sized only for a small
+ * check-in request; a stack overflow there was caught and rebooted the
+ * whole device on the first real attempt to run this inline). */
+#define OTA_TASK_STACK_SIZE      16384
 #define OTA_HTTP_TIMEOUT_MS      30000
 #define OTA_DOWNLOAD_CHUNK_LEN   4096
 /* Comfortably covers any P256 DER signature (~70-72 bytes) plus the 2-byte
@@ -241,18 +251,9 @@ static esp_err_t download_and_verify(const char *server_url, const char *api_key
     return ESP_OK;
 }
 
-void ota_update_check_and_apply(const char *server_url, const char *api_key, const char *latest_version)
+static void do_check_and_apply(const char *server_url, const char *api_key, const char *latest_version)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    if (strcmp(latest_version, app_desc->version) == 0) {
-        return;
-    }
-
-    if (!usb_printer_host_queue_is_idle()) {
-        ESP_LOGI(TAG, "New firmware version %s available, deferring OTA until the print queue drains",
-                 latest_version);
-        return;
-    }
 
     ESP_LOGI(TAG, "New firmware version %s available (running %s) -- starting OTA", latest_version,
              app_desc->version);
@@ -277,6 +278,52 @@ void ota_update_check_and_apply(const char *server_url, const char *api_key, con
 
     ESP_LOGI(TAG, "OTA update applied, rebooting into %s", latest_version);
     esp_restart();
+}
+
+/* Heap-owned copy of the strings the OTA task needs -- api_client's own
+ * buffers (s_response_buf, the parsed cJSON tree) don't outlive its call
+ * into ota_update_check_and_apply(), and the OTA task outlives that call. */
+typedef struct {
+    char server_url[256];
+    char api_key[128];
+    char latest_version[64];
+} ota_task_args_t;
+
+static void ota_task_entry(void *arg)
+{
+    ota_task_args_t *args = (ota_task_args_t *)arg;
+    do_check_and_apply(args->server_url, args->api_key, args->latest_version);
+    free(args);
+    vTaskDelete(NULL);
+}
+
+void ota_update_check_and_apply(const char *server_url, const char *api_key, const char *latest_version)
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (strcmp(latest_version, app_desc->version) == 0) {
+        return;
+    }
+
+    if (!usb_printer_host_queue_is_idle()) {
+        ESP_LOGI(TAG, "New firmware version %s available, deferring OTA until the print queue drains",
+                 latest_version);
+        return;
+    }
+
+    ota_task_args_t *args = malloc(sizeof(ota_task_args_t));
+    if (args == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate OTA task args");
+        return;
+    }
+    strlcpy(args->server_url, server_url, sizeof(args->server_url));
+    strlcpy(args->api_key, api_key, sizeof(args->api_key));
+    strlcpy(args->latest_version, latest_version, sizeof(args->latest_version));
+
+    BaseType_t created = xTaskCreate(ota_task_entry, "ota_update", OTA_TASK_STACK_SIZE, args, 3, NULL);
+    if (created != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create OTA task");
+        free(args);
+    }
 }
 
 void ota_update_confirm_valid_if_pending(void)
