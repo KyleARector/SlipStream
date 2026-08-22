@@ -8,6 +8,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "sntp_sync.h"
 #include "wifi_creds.h"
 
 static const char *TAG = "wifi_station";
@@ -60,6 +61,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&evt->ip_info.ip));
         s_retry_backoff_ms = 0; /* reset so the next disconnect starts from the initial delay again */
+
+        /* SNTP needs network connectivity, so this is the earliest point
+         * to start it; it also re-syncs correctly on a later reconnect. */
+        esp_err_t sntp_err = sntp_sync_start();
+        if (sntp_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to start SNTP sync: %s", esp_err_to_name(sntp_err));
+        }
     }
 }
 

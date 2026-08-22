@@ -20,7 +20,10 @@ extern "C" {
  * Credentials written via BLE after this has already run (and found none)
  * are not picked up live -- a reboot is required to attempt a fresh
  * connection. Acceptable for v1: the BLE pairing button already requires
- * physical presence, and a reboot is a small ask during initial setup. */
+ * physical presence, and a reboot is a small ask during initial setup.
+ *
+ * Also kicks off SNTP time sync (see sntp_sync.h) as soon as an IP address
+ * is obtained, and again on every subsequent reconnect. */
 esp_err_t wifi_sta_start(void);
 
 #ifdef __cplusplus

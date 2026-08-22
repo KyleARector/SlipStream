@@ -57,6 +57,23 @@ around them.
   Secure Boot v2/eFuse-based secure boot. Rollback-safety is required: a
   new image must self-validate (successful first poll) before being
   marked permanently bootable.
+- **OTA signature format (confirmed in `slipstream-web` M8 — firmware M22
+  must match exactly):** Ed25519, chosen over ECDSA/RSA for a fixed-size
+  (64-byte), DER-free signature — nothing to get wrong parsing ASN.1 on
+  the firmware side. The signed image the server hosts/serves is
+  `[original firmware bytes][64-byte Ed25519 signature]` — a single
+  trailing 64-byte footer, no length prefix needed since the signature
+  size is fixed for this algorithm. Firmware M22 must: strip the last 64
+  bytes as the signature, treat everything before that as the actual
+  image to flash, and verify the signature against that image using the
+  Ed25519 public key corresponding to the maintainer's private signing
+  key (`slipstream-web`'s `scripts/sign_firmware.py generate-key`) —
+  that public key needs to be embedded in firmware, e.g. compiled into
+  `secrets.h` or a dedicated constant, as a trusted-key decision this
+  spec doesn't currently cover and M22 should account for. mbedTLS as
+  shipped with ESP-IDF v5.5.x supports Ed25519 verification; no hardware
+  crypto acceleration needed since this is a one-time per-OTA-event
+  check, not a per-boot hot path.
 - **OTA requires a one-time wired flash.** The current partition table
   (from Phase 1) doesn't have the dual-app-slot layout OTA needs — that
   layout can only be established via a wired flash, not OTA'd into
