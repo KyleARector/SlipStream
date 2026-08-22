@@ -28,6 +28,15 @@
  * you actually want to re-validate the queue behavior, then back off. */
 #define ENABLE_QUEUE_DEMO 0
 
+/* M23 text-size demo: set to 1 to send one hardcoded 3x3-sized test print
+ * once the printer is ready, for visually confirming GS ! scaling on the
+ * physical printer. Fires as its own direct transfer, bypassing the print
+ * job FSM/queue entirely -- text size isn't part of the queued job data
+ * model yet (that's later, job-type-extension work, not this milestone's
+ * scope), so this exists purely to exercise escpos_format_sized() on real
+ * hardware. Off by default, same reasoning as ENABLE_QUEUE_DEMO above. */
+#define ENABLE_TEXT_SIZE_DEMO 0
+
 /* Extra trailing feed lines purely so each print is visibly pushed past
  * the tear bar -- not part of escpos_format()'s tested output. */
 #define PRINT_EXTRA_FEED_LINES 8
@@ -81,6 +90,10 @@ typedef struct {
 
 static enum_driver_t s_driver;
 static QueueHandle_t s_incoming_jobs;
+
+#if ENABLE_TEXT_SIZE_DEMO
+static void print_text_size_demo(void);
+#endif
 
 /* Written only by enum_task, once per loop iteration below; read from any
  * task via usb_printer_host_queue_is_idle(). A single bool read/write is
@@ -174,6 +187,10 @@ static void action_get_config_desc(tracked_device_t *dev)
     usb_printer_host_enqueue_print("Job 1 of 3", 10);
     usb_printer_host_enqueue_print("Job 2 of 3", 10);
     usb_printer_host_enqueue_print("Job 3 of 3", 10);
+#endif
+
+#if ENABLE_TEXT_SIZE_DEMO
+    print_text_size_demo();
 #endif
 }
 
@@ -336,6 +353,57 @@ static void start_next_print_job(void)
         print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
     }
 }
+
+#if ENABLE_TEXT_SIZE_DEMO
+static void text_size_demo_transfer_done_cb(usb_transfer_t *transfer)
+{
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        ESP_LOGI(TAG, "Text size demo print sent (%d bytes)", transfer->actual_num_bytes);
+    } else {
+        ESP_LOGE(TAG, "Text size demo transfer failed, status=%d", transfer->status);
+    }
+    usb_host_transfer_free(transfer);
+}
+
+/* Bypasses the print job FSM/queue entirely -- see ENABLE_TEXT_SIZE_DEMO's
+ * comment above for why. */
+static void print_text_size_demo(void)
+{
+    static const char k_demo_text[] = "3x3 SIZE TEST";
+    uint8_t frame[ESCPOS_SIZED_FRAME_OVERHEAD_LEN + sizeof(k_demo_text) - 1 + PRINT_EXTRA_FEED_LINES +
+                  ESCPOS_CUT_FULL_LEN];
+    size_t frame_len = escpos_format_sized(k_demo_text, sizeof(k_demo_text) - 1, 3, 3, frame, sizeof(frame));
+    if (frame_len == 0) {
+        ESP_LOGE(TAG, "escpos_format_sized() failed to produce output for text size demo");
+        return;
+    }
+
+    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+        frame[frame_len++] = '\n';
+    }
+    memcpy(&frame[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+    frame_len += ESCPOS_CUT_FULL_LEN;
+
+    usb_transfer_t *transfer = NULL;
+    esp_err_t err = usb_host_transfer_alloc(frame_len, 0, &transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to allocate text size demo transfer: %s", esp_err_to_name(err));
+        return;
+    }
+
+    memcpy(transfer->data_buffer, frame, frame_len);
+    transfer->num_bytes = (int)frame_len;
+    transfer->device_handle = s_driver.printer_dev_hdl;
+    transfer->bEndpointAddress = s_driver.printer_bulk_out_ep;
+    transfer->callback = text_size_demo_transfer_done_cb;
+
+    err = usb_host_transfer_submit(transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to submit text size demo transfer: %s", esp_err_to_name(err));
+        usb_host_transfer_free(transfer);
+    }
+}
+#endif
 
 /* Drains anything handed off via usb_printer_host_enqueue_print() into the
  * pure-logic queue. Only enum_task ever calls print_job_queue_push(). */
