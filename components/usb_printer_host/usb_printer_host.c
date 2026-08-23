@@ -151,20 +151,22 @@ static void build_width_test_stripes(void)
  * bit=1=print (server-side fixed to match GS v 0, not Pillow's own
  * opposite convention) -- no inversion needed here.
  *
- * Capped well under what a truly enormous job could in principle request
- * (slipstream-web's own MAX_IMAGE_OUTPUT_HEIGHT_DOTS default would still
- * allow images up to ~144KB at full 576px width) -- this device's heap is
- * shared with WiFi/TLS/BLE, so a job that would exceed the cap is rejected
- * rather than risking heap exhaustion. Raised from an earlier, more
- * conservative 64KB now that fetches write directly into the USB
- * transfer's own buffer (see below) instead of a separate malloc'd
- * bitmap copied into it afterward -- peak memory need for an image job is
- * one allocation of the actual frame size, not two. Still a judgment
- * call, not an exhaustively profiled ceiling: this is DMA-capable
- * internal RAM (usb_host_transfer_alloc's requirement), a more
- * constrained pool than general heap, and this board has no PSRAM. */
-#define IMAGE_FETCH_HTTP_TIMEOUT_MS 15000
-#define IMAGE_FETCH_MAX_BITMAP_BYTES (100 * 1024)
+ * A real server image (IMAGE_SOURCE_SERVER) is streamed to the printer in
+ * bounded chunks (see stream_server_image() below) rather than held whole
+ * in one buffer, so this is now just a sanity ceiling against a corrupt or
+ * malicious width_dots*height_dots claim (e.g. a bad job that would have
+ * the device try to download gigabytes) -- not a memory constraint. Sized
+ * generously above slipstream-web's own MAX_IMAGE_OUTPUT_HEIGHT_DOTS
+ * default (~144KB at full 576px width), so any real banner it can produce
+ * fits comfortably under this. The two small in-RAM demo bitmaps don't go
+ * through streaming at all and never come close to this size. */
+#define IMAGE_FETCH_HTTP_TIMEOUT_MS 20000
+#define IMAGE_FETCH_MAX_BITMAP_BYTES (2 * 1024 * 1024)
+/* Chunk size for streaming a real server image to the printer -- small
+ * enough to never be a meaningful memory concern (comfortably fits even
+ * fragmented DMA-capable RAM), large enough to keep the number of
+ * round-trip HTTP reads + USB transfers reasonable for a tall banner. */
+#define IMAGE_STREAM_CHUNK_BYTES 4096
 
 static const char *s_server_url;
 static const char *s_api_key;
@@ -238,62 +240,13 @@ static bool parse_image_reference(const char *ref, size_t ref_len, image_job_inf
     return true;
 }
 
-static bool fetch_server_image_into(const char *image_id, size_t expected_len, uint8_t *dest)
-{
-    char url[256];
-    snprintf(url, sizeof(url), "%s/images/%s", s_server_url, image_id);
-    char auth_header[128];
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_api_key);
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = IMAGE_FETCH_HTTP_TIMEOUT_MS,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        ESP_LOGE(TAG, "Failed to init HTTP client for image fetch");
-        return false;
-    }
-    esp_http_client_set_header(client, "Authorization", auth_header);
-
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Image fetch request failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    if (status != 200) {
-        ESP_LOGW(TAG, "Image fetch returned HTTP %d", status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    /* Reads directly into the caller's destination (the USB transfer's own
-     * buffer, at the offset right after the frame header) -- no
-     * intermediate copy. */
-    int read_len = esp_http_client_read_response(client, (char *)dest, expected_len);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    if (read_len < 0 || (size_t)read_len != expected_len) {
-        ESP_LOGW(TAG, "Image fetch returned %d bytes, expected %u", read_len, (unsigned)expected_len);
-        return false;
-    }
-
-    return true;
-}
-
 /* Fills dest (sized info->width_bytes * info->height_px, already validated
- * by parse_image_reference()) with the resolved bitmap's bytes -- a plain
- * memcpy for the small in-RAM demo patterns, a direct HTTP fetch for a
- * real server image. Either way, dest is written in place; no separate
- * bitmap buffer is allocated anywhere in this path. */
-static bool fill_image_bitmap(const image_job_info_t *info, uint8_t *dest)
+ * by parse_image_reference()) with one of the small in-RAM demo patterns --
+ * a plain memcpy, since both are at most a few KB. A real server image
+ * (IMAGE_SOURCE_SERVER) never goes through this: see stream_server_image()
+ * below, which sends it straight to the printer in bounded chunks instead
+ * of ever assembling it in one buffer. */
+static bool fill_demo_bitmap(const image_job_info_t *info, uint8_t *dest)
 {
     size_t len = info->width_bytes * info->height_px;
 
@@ -313,7 +266,7 @@ static bool fill_image_bitmap(const image_job_info_t *info, uint8_t *dest)
         return true;
 
     case IMAGE_SOURCE_SERVER:
-        return fetch_server_image_into(info->image_id, len, dest);
+        return false; /* not this function's job -- see stream_server_image() */
     }
 
     return false;
@@ -363,6 +316,151 @@ typedef struct {
 
 static enum_driver_t s_driver;
 static QueueHandle_t s_incoming_jobs;
+
+/* Set up once in usb_printer_host_start(); signaled from
+ * stream_chunk_transfer_done_cb() when a chunk submitted by
+ * send_chunk_blocking() finishes. */
+static SemaphoreHandle_t s_chunk_done_sem;
+static volatile usb_transfer_status_t s_last_chunk_status;
+
+static void stream_chunk_transfer_done_cb(usb_transfer_t *transfer)
+{
+    s_last_chunk_status = transfer->status;
+    usb_host_transfer_free(transfer);
+    xSemaphoreGive(s_chunk_done_sem);
+}
+
+/* Submits one chunk (up to IMAGE_STREAM_CHUNK_BYTES) as its own USB
+ * transfer and blocks -- still on enum_task, which is fine, see
+ * ENUM_TASK_STACK_SIZE's comment on the accepted inline-fetch tradeoff --
+ * until it completes. Pumps usb_host_client_handle_events() itself while
+ * waiting, since that's what actually dispatches the completion callback
+ * that signals s_chunk_done_sem; enum_task's own outer loop would
+ * otherwise be the one doing this, so nothing new is competing for it. */
+static bool send_chunk_blocking(const uint8_t *data, size_t len)
+{
+    usb_transfer_t *transfer = NULL;
+    esp_err_t err = usb_host_transfer_alloc(len, 0, &transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to allocate image stream chunk transfer: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    memcpy(transfer->data_buffer, data, len);
+    transfer->num_bytes = (int)len;
+    transfer->device_handle = s_driver.printer_dev_hdl;
+    transfer->bEndpointAddress = s_driver.printer_bulk_out_ep;
+    transfer->callback = stream_chunk_transfer_done_cb;
+
+    err = usb_host_transfer_submit(transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to submit image stream chunk transfer: %s", esp_err_to_name(err));
+        usb_host_transfer_free(transfer);
+        return false;
+    }
+
+    while (xSemaphoreTake(s_chunk_done_sem, 0) != pdTRUE) {
+        usb_host_client_handle_events(s_driver.client_hdl, pdMS_TO_TICKS(50));
+    }
+
+    if (s_last_chunk_status != USB_TRANSFER_STATUS_COMPLETED) {
+        ESP_LOGE(TAG, "Image stream chunk transfer failed, status=%d", (int)s_last_chunk_status);
+        return false;
+    }
+    return true;
+}
+
+/* Streams a real server image to the printer: header, then bitmap data in
+ * IMAGE_STREAM_CHUNK_BYTES-sized pieces read directly off the still-open
+ * HTTP response, then the trailer -- never assembling the whole image in
+ * one buffer, however tall it is. This is what actually removes the
+ * height ceiling a single-buffer approach would otherwise impose (the
+ * 2MB IMAGE_FETCH_MAX_BITMAP_BYTES cap is a sanity check, not a memory
+ * limit -- see its comment). Each piece is sent via send_chunk_blocking(),
+ * so this blocks enum_task for the whole transfer, same accepted tradeoff
+ * as the rest of the image-job path. */
+static bool stream_server_image(const image_job_info_t *info)
+{
+    size_t total_len = info->width_bytes * info->height_px;
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/images/%s", s_server_url, info->image_id);
+    char auth_header[128];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_api_key);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = IMAGE_FETCH_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to init HTTP client for image stream");
+        return false;
+    }
+    esp_http_client_set_header(client, "Authorization", auth_header);
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Image stream request failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGW(TAG, "Image stream returned HTTP %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    uint8_t header_buf[ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN];
+    size_t header_len = escpos_format_raster_header(info->width_bytes, info->height_px, header_buf, sizeof(header_buf));
+    if (header_len == 0 || !send_chunk_blocking(header_buf, header_len)) {
+        ESP_LOGE(TAG, "Failed to send image stream header");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    uint8_t chunk_buf[IMAGE_STREAM_CHUNK_BYTES];
+    size_t remaining = total_len;
+    bool ok = true;
+    while (remaining > 0 && ok) {
+        size_t want = remaining < sizeof(chunk_buf) ? remaining : sizeof(chunk_buf);
+        int read_len = esp_http_client_read(client, (char *)chunk_buf, want);
+        if (read_len <= 0) {
+            ESP_LOGW(TAG, "Image stream read failed (%d) with %u bytes remaining", read_len, (unsigned)remaining);
+            ok = false;
+            break;
+        }
+        ok = send_chunk_blocking(chunk_buf, (size_t)read_len);
+        remaining -= (size_t)read_len;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (!ok) {
+        return false;
+    }
+
+    /* Matches the single-shot path's trailer exactly (escpos_format_raster()'s
+     * own trailing LF, plus start_next_print_job()'s extra feed lines + cut)
+     * since this bypasses that path entirely for a streamed image. */
+    uint8_t trailer_buf[1 + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN];
+    size_t trailer_len = 0;
+    trailer_buf[trailer_len++] = 0x0A;
+    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+        trailer_buf[trailer_len++] = '\n';
+    }
+    memcpy(&trailer_buf[trailer_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+    trailer_len += ESCPOS_CUT_FULL_LEN;
+
+    return send_chunk_blocking(trailer_buf, trailer_len);
+}
 
 #if ENABLE_TEXT_SIZE_DEMO
 static void print_text_size_demo(void);
@@ -598,22 +696,45 @@ static void start_next_print_job(void)
 
     print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_START);
 
-    /* The frame is built directly into the transfer's own heap-allocated
-     * data_buffer, never staged in a separate buffer first -- for an image
-     * job in particular, fetching bitmap bytes straight into their final
-     * destination (rather than a separate malloc'd copy) keeps peak memory
-     * need at one allocation of the actual frame size, not two. */
     image_job_info_t image_info;
-    size_t frame_capacity;
-
-    if (job.type == PRINT_JOB_TYPE_TEXT) {
-        frame_capacity = ESCPOS_FRAME_OVERHEAD_LEN + job.payload_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
-    } else {
+    if (job.type == PRINT_JOB_TYPE_IMAGE) {
         if (!parse_image_reference(job.payload, job.payload_len, &image_info)) {
             ESP_LOGE(TAG, "Unable to resolve image reference: %.*s", (int)job.payload_len, job.payload);
             print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
             return;
         }
+
+        if (image_info.source == IMAGE_SOURCE_SERVER) {
+            /* Streamed in bounded chunks -- see stream_server_image()'s
+             * comment for why this never assembles the whole image in one
+             * buffer, however tall it is. By the time this returns, the
+             * header, every data chunk, and the trailer have all already
+             * been submitted and confirmed sent, so FORMATTED/SENT/PRINTED
+             * fire together rather than at separate points in time -- an
+             * honest simplification, not a shortcut: unlike the single-shot
+             * path below, there's no meaningful "formatted but not yet
+             * sent" moment to distinguish here. */
+            bool ok = stream_server_image(&image_info);
+            if (ok) {
+                print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
+                print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_SENT);
+                print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_PRINTED);
+                ESP_LOGI(TAG, "Image job streamed and printed");
+            } else {
+                ESP_LOGE(TAG, "Failed to stream image job");
+                print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+            }
+            return;
+        }
+    }
+
+    /* Single-shot path: text jobs and the two small in-RAM demo bitmaps.
+     * The frame is built directly into the transfer's own heap-allocated
+     * data_buffer, never staged in a separate buffer first. */
+    size_t frame_capacity;
+    if (job.type == PRINT_JOB_TYPE_TEXT) {
+        frame_capacity = ESCPOS_FRAME_OVERHEAD_LEN + job.payload_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
+    } else {
         frame_capacity = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + (image_info.width_bytes * image_info.height_px) +
                           PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
     }
@@ -633,8 +754,7 @@ static void start_next_print_job(void)
         size_t header_len =
             escpos_format_raster_header(image_info.width_bytes, image_info.height_px, transfer->data_buffer,
                                          frame_capacity);
-        if (header_len == 0 ||
-            !fill_image_bitmap(&image_info, transfer->data_buffer + header_len)) {
+        if (header_len == 0 || !fill_demo_bitmap(&image_info, transfer->data_buffer + header_len)) {
             ESP_LOGE(TAG, "Failed to build image frame for queued job");
             usb_host_transfer_free(transfer);
             print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
@@ -882,6 +1002,11 @@ esp_err_t usb_printer_host_start(const char *server_url, const char *api_key)
 
     s_incoming_jobs = xQueueCreate(INCOMING_JOB_QUEUE_LEN, sizeof(incoming_job_msg_t));
     if (s_incoming_jobs == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_chunk_done_sem = xSemaphoreCreateBinary();
+    if (s_chunk_done_sem == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
