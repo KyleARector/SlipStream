@@ -33,9 +33,17 @@ esp_err_t usb_printer_host_start(const char *server_url, const char *api_key);
  * job FSM and its queue (see the spec's Concurrency Model); never touches
  * those pure-logic structures directly.
  *
+ * cut_after controls whether the printer feeds+cuts after this job before
+ * starting the next queued one -- pass false to let this job's strip stay
+ * physically joined to whatever prints right after it (e.g. an image
+ * immediately followed by its "From: @user" attribution as one continuous
+ * receipt instead of two separate strips). Callers that don't care about
+ * this should pass true, matching the printer's previous unconditional
+ * per-job cut behavior.
+ *
  * Returns ESP_ERR_INVALID_ARG if text is NULL or text_len is too long for
  * a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */
-esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len);
+esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len, bool cut_after);
 
 /* Enqueues an image job carrying only a reference/handle string, not image
  * bytes (M24) -- the actual bitmap is resolved when the job is dequeued for
@@ -48,9 +56,12 @@ esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len);
  * dequeue-time fetch knows how many bytes to read without a second
  * round-trip just to ask the size.
  *
+ * cut_after has the same meaning as usb_printer_host_enqueue_print()'s --
+ * see its doc comment.
+ *
  * Returns ESP_ERR_INVALID_ARG if image_ref is NULL or image_ref_len is too
  * long for a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */
-esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len);
+esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len, bool cut_after);
 
 /* True when there's no incoming/queued/in-flight print job anywhere in the
  * pipeline (the handoff queue, the pure-logic print_job_queue, and the FSM

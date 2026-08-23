@@ -56,6 +56,14 @@ static void handle_checkin_response(const char *json_str)
                 continue;
             }
 
+            /* Whether the printer feeds+cuts after this job before starting
+             * the next one -- defaults to true (preserves the printer's
+             * previous unconditional per-job cut) when absent, so older
+             * server responses without this field still behave exactly as
+             * before. See usb_printer_host_enqueue_print()'s doc comment. */
+            cJSON *cut_after_json = cJSON_GetObjectItemCaseSensitive(job, "cut_after");
+            bool cut_after = !cJSON_IsBool(cut_after_json) || cJSON_IsTrue(cut_after_json);
+
             if (strcmp(type->valuestring, "text") == 0) {
                 cJSON *text = cJSON_GetObjectItemCaseSensitive(job, "text");
                 if (!cJSON_IsString(text)) {
@@ -70,7 +78,7 @@ static void handle_checkin_response(const char *json_str)
                  * FreeRTOS queue rather than touching the print job
                  * FSM/queue directly (see M8's Concurrency Model note;
                  * same entry point BLE uses). */
-                esp_err_t print_err = usb_printer_host_enqueue_print(text->valuestring, len);
+                esp_err_t print_err = usb_printer_host_enqueue_print(text->valuestring, len, cut_after);
                 if (print_err != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to enqueue server print job: %s", esp_err_to_name(print_err));
                 }
@@ -99,7 +107,7 @@ static void handle_checkin_response(const char *json_str)
 
                 ESP_LOGI(TAG, "Enqueuing image job from server (%dx%d dots)", width_dots->valueint,
                          height_dots->valueint);
-                esp_err_t print_err = usb_printer_host_enqueue_image(encoded_ref, (size_t)written);
+                esp_err_t print_err = usb_printer_host_enqueue_image(encoded_ref, (size_t)written, cut_after);
                 if (print_err != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to enqueue server image job: %s", esp_err_to_name(print_err));
                 }

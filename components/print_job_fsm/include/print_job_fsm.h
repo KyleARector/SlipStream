@@ -61,6 +61,12 @@ typedef struct {
      * reference is just another short string. */
     char payload[PRINT_JOB_TEXT_MAX_LEN];
     size_t payload_len;
+    /* Whether the printer should feed+cut after this job before starting
+     * the next queued one. false lets a group of jobs (e.g. an image and
+     * its "From: @user" attribution) print as one continuous strip instead
+     * of separate ones -- see usb_printer_host_enqueue_print()'s doc
+     * comment for how the feed/cut skip is applied. */
+    bool cut_after;
 } print_job_t;
 
 typedef struct {
@@ -75,9 +81,10 @@ bool print_job_queue_is_full(const print_job_queue_t *queue);
 size_t print_job_queue_count(const print_job_queue_t *queue);
 
 /* Copies payload (payload_len bytes, not required to be NUL-terminated)
- * into a new queue slot tagged with type. Fails if the queue is full or
- * payload_len is too long for PRINT_JOB_TEXT_MAX_LEN. */
-bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const char *payload, size_t payload_len);
+ * into a new queue slot tagged with type and cut_after. Fails if the queue
+ * is full or payload_len is too long for PRINT_JOB_TEXT_MAX_LEN. */
+bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const char *payload, size_t payload_len,
+                           bool cut_after);
 
 /* Pops the oldest job into *out_job (if non-NULL). Fails if empty. */
 bool print_job_queue_pop(print_job_queue_t *queue, print_job_t *out_job);

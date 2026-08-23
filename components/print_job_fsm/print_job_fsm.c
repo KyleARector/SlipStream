@@ -112,7 +112,8 @@ size_t print_job_queue_count(const print_job_queue_t *queue)
     return queue == NULL ? 0 : queue->count;
 }
 
-bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const char *payload, size_t payload_len)
+bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const char *payload, size_t payload_len,
+                           bool cut_after)
 {
     if (queue == NULL || payload == NULL) {
         return false;
@@ -129,6 +130,7 @@ bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const
     memcpy(queue->jobs[tail].payload, payload, payload_len);
     queue->jobs[tail].payload[payload_len] = '\0';
     queue->jobs[tail].payload_len = payload_len;
+    queue->jobs[tail].cut_after = cut_after;
     queue->count++;
     return true;
 }

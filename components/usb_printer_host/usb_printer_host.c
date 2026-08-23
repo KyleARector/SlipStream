@@ -295,6 +295,7 @@ typedef struct {
     print_job_type_t type;
     char payload[PRINT_JOB_TEXT_MAX_LEN];
     size_t payload_len;
+    bool cut_after;
 } incoming_job_msg_t;
 
 typedef struct {
@@ -378,8 +379,11 @@ static bool send_chunk_blocking(const uint8_t *data, size_t len)
  * 2MB IMAGE_FETCH_MAX_BITMAP_BYTES cap is a sanity check, not a memory
  * limit -- see its comment). Each piece is sent via send_chunk_blocking(),
  * so this blocks enum_task for the whole transfer, same accepted tradeoff
- * as the rest of the image-job path. */
-static bool stream_server_image(const image_job_info_t *info)
+ * as the rest of the image-job path. Gated on cut_after the same way as
+ * the single-shot path below: when false, the trailer is just the raster
+ * data's own LF -- no extra feed padding, no cut -- so this job's strip
+ * stays physically joined to whatever prints right after it. */
+static bool stream_server_image(const image_job_info_t *info, bool cut_after)
 {
     size_t total_len = info->width_bytes * info->height_px;
 
@@ -447,17 +451,16 @@ static bool stream_server_image(const image_job_info_t *info)
         return false;
     }
 
-    /* Matches the single-shot path's trailer exactly (escpos_format_raster()'s
-     * own trailing LF, plus start_next_print_job()'s extra feed lines + cut)
-     * since this bypasses that path entirely for a streamed image. */
     uint8_t trailer_buf[1 + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN];
     size_t trailer_len = 0;
     trailer_buf[trailer_len++] = 0x0A;
-    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
-        trailer_buf[trailer_len++] = '\n';
+    if (cut_after) {
+        for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+            trailer_buf[trailer_len++] = '\n';
+        }
+        memcpy(&trailer_buf[trailer_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+        trailer_len += ESCPOS_CUT_FULL_LEN;
     }
-    memcpy(&trailer_buf[trailer_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
-    trailer_len += ESCPOS_CUT_FULL_LEN;
 
     return send_chunk_blocking(trailer_buf, trailer_len);
 }
@@ -555,9 +558,9 @@ static void action_get_config_desc(tracked_device_t *dev)
     ESP_LOGI(TAG, "Printer ready (bulk OUT endpoint 0x%02X)", ep_addr);
 
 #if ENABLE_QUEUE_DEMO
-    usb_printer_host_enqueue_print("Job 1 of 3", 10);
-    usb_printer_host_enqueue_print("Job 2 of 3", 10);
-    usb_printer_host_enqueue_print("Job 3 of 3", 10);
+    usb_printer_host_enqueue_print("Job 1 of 3", 10, true);
+    usb_printer_host_enqueue_print("Job 2 of 3", 10, true);
+    usb_printer_host_enqueue_print("Job 3 of 3", 10, true);
 #endif
 
 #if ENABLE_TEXT_SIZE_DEMO
@@ -565,11 +568,11 @@ static void action_get_config_desc(tracked_device_t *dev)
 #endif
 
 #if ENABLE_IMAGE_DEMO
-    usb_printer_host_enqueue_image(DEMO_IMAGE_REF, strlen(DEMO_IMAGE_REF));
+    usb_printer_host_enqueue_image(DEMO_IMAGE_REF, strlen(DEMO_IMAGE_REF), true);
 #endif
 
 #if ENABLE_WIDTH_TEST_DEMO
-    usb_printer_host_enqueue_image(WIDTH_TEST_REF, strlen(WIDTH_TEST_REF));
+    usb_printer_host_enqueue_image(WIDTH_TEST_REF, strlen(WIDTH_TEST_REF), true);
 #endif
 }
 
@@ -714,7 +717,7 @@ static void start_next_print_job(void)
              * honest simplification, not a shortcut: unlike the single-shot
              * path below, there's no meaningful "formatted but not yet
              * sent" moment to distinguish here. */
-            bool ok = stream_server_image(&image_info);
+            bool ok = stream_server_image(&image_info, job.cut_after);
             if (ok) {
                 print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
                 print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_SENT);
@@ -772,11 +775,13 @@ static void start_next_print_job(void)
     }
     print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
 
-    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
-        transfer->data_buffer[frame_len++] = '\n';
+    if (job.cut_after) {
+        for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+            transfer->data_buffer[frame_len++] = '\n';
+        }
+        memcpy(&transfer->data_buffer[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+        frame_len += ESCPOS_CUT_FULL_LEN;
     }
-    memcpy(&transfer->data_buffer[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
-    frame_len += ESCPOS_CUT_FULL_LEN;
 
     transfer->num_bytes = (int)frame_len;
     transfer->device_handle = s_driver.printer_dev_hdl;
@@ -849,7 +854,7 @@ static void drain_incoming_jobs(void)
 {
     incoming_job_msg_t msg;
     while (xQueueReceive(s_incoming_jobs, &msg, 0) == pdTRUE) {
-        if (!print_job_queue_push(&s_driver.print_queue, msg.type, msg.payload, msg.payload_len)) {
+        if (!print_job_queue_push(&s_driver.print_queue, msg.type, msg.payload, msg.payload_len, msg.cut_after)) {
             ESP_LOGW(TAG, "Print job queue full, dropping job: %.*s", (int)msg.payload_len, msg.payload);
         }
     }
@@ -884,7 +889,7 @@ bool usb_printer_host_queue_is_idle(void)
     return s_queue_idle;
 }
 
-esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
+esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len, bool cut_after)
 {
     if (text == NULL || text_len >= PRINT_JOB_TEXT_MAX_LEN) {
         return ESP_ERR_INVALID_ARG;
@@ -894,6 +899,7 @@ esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
     msg.type = PRINT_JOB_TYPE_TEXT;
     memcpy(msg.payload, text, text_len);
     msg.payload_len = text_len;
+    msg.cut_after = cut_after;
 
     if (xQueueSend(s_incoming_jobs, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -901,7 +907,7 @@ esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
     return ESP_OK;
 }
 
-esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len)
+esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len, bool cut_after)
 {
     if (image_ref == NULL || image_ref_len >= PRINT_JOB_TEXT_MAX_LEN) {
         return ESP_ERR_INVALID_ARG;
@@ -911,6 +917,7 @@ esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref
     msg.type = PRINT_JOB_TYPE_IMAGE;
     memcpy(msg.payload, image_ref, image_ref_len);
     msg.payload_len = image_ref_len;
+    msg.cut_after = cut_after;
 
     if (xQueueSend(s_incoming_jobs, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
