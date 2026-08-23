@@ -79,19 +79,15 @@ size_t escpos_format_sized(const char *text, size_t text_len, uint8_t width_mult
     return offset;
 }
 
-size_t escpos_format_raster(const uint8_t *bitmap_data, size_t width_bytes, size_t height_px, uint8_t *out_buf,
-                             size_t out_buf_capacity)
+size_t escpos_format_raster_header(size_t width_bytes, size_t height_px, uint8_t *out_buf, size_t out_buf_capacity)
 {
-    if (out_buf == NULL || bitmap_data == NULL) {
+    if (out_buf == NULL) {
         return 0;
     }
     if (width_bytes == 0 || width_bytes > 0xFFFF || height_px == 0 || height_px > 0xFFFF) {
         return 0;
     }
-
-    size_t data_len = width_bytes * height_px;
-    size_t total_len = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + data_len;
-    if (total_len > out_buf_capacity) {
+    if (ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN > out_buf_capacity) {
         return 0;
     }
 
@@ -108,6 +104,30 @@ size_t escpos_format_raster(const uint8_t *bitmap_data, size_t width_bytes, size
 
     memcpy(out_buf + offset, header, ESCPOS_CMD_RASTER_HEADER_LEN);
     offset += ESCPOS_CMD_RASTER_HEADER_LEN;
+
+    return offset;
+}
+
+size_t escpos_format_raster(const uint8_t *bitmap_data, size_t width_bytes, size_t height_px, uint8_t *out_buf,
+                             size_t out_buf_capacity)
+{
+    if (bitmap_data == NULL) {
+        return 0;
+    }
+    if (width_bytes == 0 || width_bytes > 0xFFFF || height_px == 0 || height_px > 0xFFFF) {
+        return 0;
+    }
+
+    size_t data_len = width_bytes * height_px;
+    size_t total_len = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + data_len;
+    if (total_len > out_buf_capacity) {
+        return 0;
+    }
+
+    size_t offset = escpos_format_raster_header(width_bytes, height_px, out_buf, out_buf_capacity);
+    if (offset == 0) {
+        return 0;
+    }
 
     memcpy(out_buf + offset, bitmap_data, data_len);
     offset += data_len;

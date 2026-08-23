@@ -73,6 +73,22 @@ size_t escpos_format_sized(const char *text, size_t text_len, uint8_t width_mult
  * caller: width_bytes * height_px). */
 #define ESCPOS_RASTER_FRAME_OVERHEAD_LEN (ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN + ESCPOS_TRAILER_LEN)
 
+/* Writes just the init sequence + GS v 0 header (ESCPOS_CMD_INIT_LEN +
+ * ESCPOS_CMD_RASTER_HEADER_LEN bytes) -- no bitmap data, no trailer. For a
+ * caller that wants to stream/fetch bitmap bytes directly into its own
+ * destination buffer immediately after this header (e.g. an HTTP response
+ * body written straight into a USB transfer buffer) rather than handing
+ * escpos_format_raster() a bitmap that's already fully in RAM to copy
+ * from -- avoids holding two copies of a potentially large bitmap at
+ * once. escpos_format_raster() itself is built on top of this.
+ *
+ * width_bytes and height_px must each be in [1, 0xFFFF], matching
+ * escpos_format_raster(). Writes at most out_buf_capacity bytes to
+ * out_buf. Returns the number of bytes written (always
+ * ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN on success), or 0 if
+ * out_buf is too small or any argument is invalid. */
+size_t escpos_format_raster_header(size_t width_bytes, size_t height_px, uint8_t *out_buf, size_t out_buf_capacity);
+
 /* Formats a pre-rendered 1-bit-per-pixel bitmap into an ESC/POS byte
  * stream: init sequence + GS v 0 raster header + bitmap data verbatim +
  * one trailing line feed.

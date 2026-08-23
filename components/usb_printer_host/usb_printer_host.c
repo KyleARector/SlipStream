@@ -1,7 +1,6 @@
 #include "usb_printer_host.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "esp_crt_bundle.h"
@@ -145,8 +144,8 @@ static void build_width_test_stripes(void)
 /* Real server-fetched image jobs (M25). api_client encodes the reference
  * as "{image_ref}:{width_dots}x{height_dots}" from the check-in response's
  * job fields (see usb_printer_host.h) -- carrying the dimensions in the
- * reference itself means this fetch knows exactly how many bytes to
- * expect without a separate round-trip just to ask.
+ * reference itself means the exact frame size is known before any bytes
+ * are fetched.
  *
  * Bit polarity: GET /images/{image_ref} already returns bytes with
  * bit=1=print (server-side fixed to match GS v 0, not Pillow's own
@@ -155,32 +154,92 @@ static void build_width_test_stripes(void)
  * Capped well under what a truly enormous job could in principle request
  * (slipstream-web's own MAX_IMAGE_OUTPUT_HEIGHT_DOTS default would still
  * allow images up to ~144KB at full 576px width) -- this device's heap is
- * shared with WiFi/TLS/BLE, so a single image allocation this large isn't
- * safe to permit unconditionally; a job that would exceed the cap is
- * rejected rather than risking heap exhaustion. */
+ * shared with WiFi/TLS/BLE, so a job that would exceed the cap is rejected
+ * rather than risking heap exhaustion. Raised from an earlier, more
+ * conservative 64KB now that fetches write directly into the USB
+ * transfer's own buffer (see below) instead of a separate malloc'd
+ * bitmap copied into it afterward -- peak memory need for an image job is
+ * one allocation of the actual frame size, not two. Still a judgment
+ * call, not an exhaustively profiled ceiling: this is DMA-capable
+ * internal RAM (usb_host_transfer_alloc's requirement), a more
+ * constrained pool than general heap, and this board has no PSRAM. */
 #define IMAGE_FETCH_HTTP_TIMEOUT_MS 15000
-#define IMAGE_FETCH_MAX_BITMAP_BYTES (64 * 1024)
+#define IMAGE_FETCH_MAX_BITMAP_BYTES (100 * 1024)
 
 static const char *s_server_url;
 static const char *s_api_key;
 
-static bool fetch_server_image(const char *image_id, size_t width_dots, size_t height_dots, uint8_t **out_bitmap,
-                                size_t *out_width_bytes, size_t *out_height_px)
+/* Which bitmap source a parsed reference resolved to -- see
+ * parse_image_reference()/fill_image_bitmap() below. */
+typedef enum {
+    IMAGE_SOURCE_DEMO_CHECKERBOARD,
+    IMAGE_SOURCE_DEMO_WIDTH_TEST,
+    IMAGE_SOURCE_SERVER,
+} image_source_t;
+
+typedef struct {
+    image_source_t source;
+    char image_id[64]; /* only meaningful when source == IMAGE_SOURCE_SERVER */
+    size_t width_bytes;
+    size_t height_px;
+} image_job_info_t;
+
+/* Parses a reference and validates/reports its dimensions, but fetches no
+ * bytes -- lets the caller compute the exact frame size and allocate the
+ * USB transfer buffer *before* any bitmap data exists anywhere, so
+ * fill_image_bitmap() below can write directly into that buffer instead
+ * of a separate allocation. Returns false for an unrecognized reference,
+ * a malformed "{ref}:{w}x{h}" encoding, or dimensions that would exceed
+ * IMAGE_FETCH_MAX_BITMAP_BYTES. */
+static bool parse_image_reference(const char *ref, size_t ref_len, image_job_info_t *out_info)
 {
+    if (ref_len == strlen(DEMO_IMAGE_REF) && memcmp(ref, DEMO_IMAGE_REF, ref_len) == 0) {
+        out_info->source = IMAGE_SOURCE_DEMO_CHECKERBOARD;
+        out_info->width_bytes = DEMO_IMAGE_WIDTH_BYTES;
+        out_info->height_px = DEMO_IMAGE_HEIGHT_PX;
+        return true;
+    }
+
+    if (ref_len == strlen(WIDTH_TEST_REF) && memcmp(ref, WIDTH_TEST_REF, ref_len) == 0) {
+        out_info->source = IMAGE_SOURCE_DEMO_WIDTH_TEST;
+        out_info->width_bytes = WIDTH_TEST_WIDTH_BYTES;
+        out_info->height_px = WIDTH_TEST_HEIGHT_PX;
+        return true;
+    }
+
+    /* Otherwise, expect "{image_ref}:{width_dots}x{height_dots}" -- see
+     * usb_printer_host_enqueue_image()'s doc comment. image_ref is a UUID
+     * (36 chars), but sized generously here rather than hardcoded to that
+     * exact length. ref is NUL-terminated by print_job_queue_push()/the
+     * incoming-job message copy, so treating it as a plain C string here
+     * is safe. */
+    unsigned width_dots = 0;
+    unsigned height_dots = 0;
+    if (ref_len >= sizeof(out_info->image_id)) {
+        return false;
+    }
+    if (sscanf(ref, "%63[^:]:%ux%u", out_info->image_id, &width_dots, &height_dots) != 3) {
+        return false;
+    }
+    if (width_dots == 0 || height_dots == 0) {
+        return false;
+    }
+
     size_t width_bytes = (width_dots + 7) / 8;
     size_t bitmap_len = width_bytes * height_dots;
-    if (width_dots == 0 || height_dots == 0 || bitmap_len > IMAGE_FETCH_MAX_BITMAP_BYTES) {
-        ESP_LOGE(TAG, "Image job dimensions invalid or too large (%ux%u dots)", (unsigned)width_dots,
-                 (unsigned)height_dots);
+    if (bitmap_len > IMAGE_FETCH_MAX_BITMAP_BYTES) {
+        ESP_LOGE(TAG, "Image job dimensions too large (%ux%u dots)", width_dots, height_dots);
         return false;
     }
 
-    uint8_t *bitmap = malloc(bitmap_len);
-    if (bitmap == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate %u bytes for image fetch", (unsigned)bitmap_len);
-        return false;
-    }
+    out_info->source = IMAGE_SOURCE_SERVER;
+    out_info->width_bytes = width_bytes;
+    out_info->height_px = height_dots;
+    return true;
+}
 
+static bool fetch_server_image_into(const char *image_id, size_t expected_len, uint8_t *dest)
+{
     char url[256];
     snprintf(url, sizeof(url), "%s/images/%s", s_server_url, image_id);
     char auth_header[128];
@@ -194,7 +253,6 @@ static bool fetch_server_image(const char *image_id, size_t width_dots, size_t h
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(TAG, "Failed to init HTTP client for image fetch");
-        free(bitmap);
         return false;
     }
     esp_http_client_set_header(client, "Authorization", auth_header);
@@ -203,7 +261,6 @@ static bool fetch_server_image(const char *image_id, size_t width_dots, size_t h
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Image fetch request failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        free(bitmap);
         return false;
     }
 
@@ -213,87 +270,53 @@ static bool fetch_server_image(const char *image_id, size_t width_dots, size_t h
         ESP_LOGW(TAG, "Image fetch returned HTTP %d", status);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        free(bitmap);
         return false;
     }
 
-    int read_len = esp_http_client_read_response(client, (char *)bitmap, bitmap_len);
+    /* Reads directly into the caller's destination (the USB transfer's own
+     * buffer, at the offset right after the frame header) -- no
+     * intermediate copy. */
+    int read_len = esp_http_client_read_response(client, (char *)dest, expected_len);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (read_len < 0 || (size_t)read_len != bitmap_len) {
-        ESP_LOGW(TAG, "Image fetch returned %d bytes, expected %u", read_len, (unsigned)bitmap_len);
-        free(bitmap);
+    if (read_len < 0 || (size_t)read_len != expected_len) {
+        ESP_LOGW(TAG, "Image fetch returned %d bytes, expected %u", read_len, (unsigned)expected_len);
         return false;
     }
 
-    *out_bitmap = bitmap;
-    *out_width_bytes = width_bytes;
-    *out_height_px = height_dots;
     return true;
 }
 
-/* Returns false (unresolvable reference, malformed encoding, fetch
- * failure) rather than crashing/asserting -- a network fetch can fail in
- * plenty of ordinary ways (expired reference already downloaded/deleted
- * server-side, timeout, 404), so the caller already has to handle this
- * path regardless. On success, *out_bitmap is heap-allocated and the
- * caller owns it (must free() it after use) -- true uniformly for the
- * demo bitmaps too (copied out of their static backing arrays into a
- * fresh allocation), so start_next_print_job() has exactly one ownership
- * rule to follow regardless of which reference resolved. */
-static bool resolve_image_reference(const char *ref, size_t ref_len, uint8_t **out_bitmap, size_t *out_width_bytes,
-                                     size_t *out_height_px)
+/* Fills dest (sized info->width_bytes * info->height_px, already validated
+ * by parse_image_reference()) with the resolved bitmap's bytes -- a plain
+ * memcpy for the small in-RAM demo patterns, a direct HTTP fetch for a
+ * real server image. Either way, dest is written in place; no separate
+ * bitmap buffer is allocated anywhere in this path. */
+static bool fill_image_bitmap(const image_job_info_t *info, uint8_t *dest)
 {
-    if (ref_len == strlen(DEMO_IMAGE_REF) && memcmp(ref, DEMO_IMAGE_REF, ref_len) == 0) {
+    size_t len = info->width_bytes * info->height_px;
+
+    switch (info->source) {
+    case IMAGE_SOURCE_DEMO_CHECKERBOARD:
         if (!s_demo_bitmap_built) {
             build_demo_checkerboard();
         }
-        size_t len = sizeof(s_demo_bitmap);
-        uint8_t *copy = malloc(len);
-        if (copy == NULL) {
-            return false;
-        }
-        memcpy(copy, s_demo_bitmap, len);
-        *out_bitmap = copy;
-        *out_width_bytes = DEMO_IMAGE_WIDTH_BYTES;
-        *out_height_px = DEMO_IMAGE_HEIGHT_PX;
+        memcpy(dest, s_demo_bitmap, len);
         return true;
-    }
 
-    if (ref_len == strlen(WIDTH_TEST_REF) && memcmp(ref, WIDTH_TEST_REF, ref_len) == 0) {
+    case IMAGE_SOURCE_DEMO_WIDTH_TEST:
         if (!s_width_test_bitmap_built) {
             build_width_test_stripes();
         }
-        size_t len = sizeof(s_width_test_bitmap);
-        uint8_t *copy = malloc(len);
-        if (copy == NULL) {
-            return false;
-        }
-        memcpy(copy, s_width_test_bitmap, len);
-        *out_bitmap = copy;
-        *out_width_bytes = WIDTH_TEST_WIDTH_BYTES;
-        *out_height_px = WIDTH_TEST_HEIGHT_PX;
+        memcpy(dest, s_width_test_bitmap, len);
         return true;
+
+    case IMAGE_SOURCE_SERVER:
+        return fetch_server_image_into(info->image_id, len, dest);
     }
 
-    /* Otherwise, expect "{image_ref}:{width_dots}x{height_dots}" -- see
-     * usb_printer_host_enqueue_image()'s doc comment. image_ref is a UUID
-     * (36 chars), but sized generously here rather than hardcoded to that
-     * exact length. */
-    char image_id[64];
-    unsigned width_dots = 0;
-    unsigned height_dots = 0;
-    if (ref_len >= sizeof(image_id)) {
-        return false;
-    }
-    /* ref is NUL-terminated by print_job_queue_push()/the incoming-job
-     * message copy, so treating it as a plain C string here is safe. */
-    if (sscanf(ref, "%63[^:]:%ux%u", image_id, &width_dots, &height_dots) != 3) {
-        return false;
-    }
-
-    return fetch_server_image(image_id, width_dots, height_dots, out_bitmap, out_width_bytes, out_height_px);
+    return false;
 }
 
 typedef enum {
@@ -575,26 +598,23 @@ static void start_next_print_job(void)
 
     print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_START);
 
-    /* Image bytes can be far larger than text (up to a full raster banner
-     * in later milestones), so the frame is built directly into the
-     * transfer's own heap-allocated data_buffer rather than staged in a
-     * local array first -- enum_task's stack (ENUM_TASK_STACK_SIZE) is
-     * sized for small text jobs, not for holding a whole image frame
-     * twice over. */
-    uint8_t *bitmap = NULL;
-    size_t bitmap_width_bytes = 0;
-    size_t bitmap_height_px = 0;
+    /* The frame is built directly into the transfer's own heap-allocated
+     * data_buffer, never staged in a separate buffer first -- for an image
+     * job in particular, fetching bitmap bytes straight into their final
+     * destination (rather than a separate malloc'd copy) keeps peak memory
+     * need at one allocation of the actual frame size, not two. */
+    image_job_info_t image_info;
     size_t frame_capacity;
 
     if (job.type == PRINT_JOB_TYPE_TEXT) {
         frame_capacity = ESCPOS_FRAME_OVERHEAD_LEN + job.payload_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
     } else {
-        if (!resolve_image_reference(job.payload, job.payload_len, &bitmap, &bitmap_width_bytes, &bitmap_height_px)) {
+        if (!parse_image_reference(job.payload, job.payload_len, &image_info)) {
             ESP_LOGE(TAG, "Unable to resolve image reference: %.*s", (int)job.payload_len, job.payload);
             print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
             return;
         }
-        frame_capacity = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + (bitmap_width_bytes * bitmap_height_px) +
+        frame_capacity = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + (image_info.width_bytes * image_info.height_px) +
                           PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
     }
 
@@ -602,7 +622,6 @@ static void start_next_print_job(void)
     esp_err_t err = usb_host_transfer_alloc(frame_capacity, 0, &transfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate print transfer: %s", esp_err_to_name(err));
-        free(bitmap);
         print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
         return;
     }
@@ -611,10 +630,19 @@ static void start_next_print_job(void)
     if (job.type == PRINT_JOB_TYPE_TEXT) {
         frame_len = escpos_format(job.payload, job.payload_len, transfer->data_buffer, frame_capacity);
     } else {
-        frame_len =
-            escpos_format_raster(bitmap, bitmap_width_bytes, bitmap_height_px, transfer->data_buffer, frame_capacity);
+        size_t header_len =
+            escpos_format_raster_header(image_info.width_bytes, image_info.height_px, transfer->data_buffer,
+                                         frame_capacity);
+        if (header_len == 0 ||
+            !fill_image_bitmap(&image_info, transfer->data_buffer + header_len)) {
+            ESP_LOGE(TAG, "Failed to build image frame for queued job");
+            usb_host_transfer_free(transfer);
+            print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+            return;
+        }
+        frame_len = header_len + (image_info.width_bytes * image_info.height_px);
+        transfer->data_buffer[frame_len++] = 0x0A; /* matches escpos_format_raster()'s own trailing LF */
     }
-    free(bitmap); /* copied into transfer->data_buffer already (or never allocated, for text jobs) -- safe to free unconditionally, free(NULL) is a no-op */
 
     if (frame_len == 0) {
         ESP_LOGE(TAG, "escpos formatter failed to produce output for queued job");
