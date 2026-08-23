@@ -129,12 +129,17 @@ Is the office WiFi a simple WPA2-PSK network, or enterprise auth
 (WPA2/3-Enterprise)? The latter is a meaningfully larger firmware feature.
 Don't assume PSK without confirming.
 
-## Open Item — confirm before scoping M24/M25
+## Confirmed — TM-H2000 print width: 576 dots
 
-The TM-H2000's actual print width in dots is unconfirmed. Server-side
-image rendering (in the `slipstream-web` repo) needs this to know what
-size bitmap to produce — check the printer's ESC/POS command reference or
-test empirically rather than assuming a value.
+Confirmed empirically during M24: an 8-stripe, 576px-wide raster test
+pattern (72px/stripe, alternating black/white) printed correctly on the
+physical unit, all 8 stripes intact, no clipping or wraparound. Matches
+the printer's datasheet figure (203dpi × 203dpi, 2.83in/72mm print width
+= 576 dots). A small fixed margin (~1/4 stripe width, ~18px) appears on
+each edge — that's the printer's own mechanical printhead-to-paper
+margin, not a data-width issue; 576 is still the correct value to send
+in `GS v 0`'s width field. Server-side image rendering (`slipstream-web`)
+should target 576px-wide output.
 
 ## Milestones (continuing from Phase 1's M1–M10; M11–M14 are the
 QR/image stretch milestones already scoped in the original spec)

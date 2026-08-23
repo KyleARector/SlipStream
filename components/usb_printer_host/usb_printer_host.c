@@ -46,6 +46,17 @@
  * reasoning as the other demo flags. */
 #define ENABLE_IMAGE_DEMO 0
 
+/* One-off empirical width test: set to 1 to print an 8-stripe, 576px-wide
+ * bar (72px/stripe) once the printer is ready, to confirm the TM-H2000's
+ * real usable print width in dots -- unconfirmed per the Phase 2 spec's
+ * open item, and a datasheet figure (203dpi, 576 dots/2.83in) exists but
+ * hadn't been checked against this specific physical unit. If 576 is
+ * right, all 8 stripes print cleanly edge-to-edge with no clipping,
+ * wraparound, or garbled trailing columns. Not meant to be a permanent
+ * fixture -- remove once the real width is confirmed and recorded in the
+ * spec. Off by default, same reasoning as the other demo flags. */
+#define ENABLE_WIDTH_TEST_DEMO 0
+
 /* Extra trailing feed lines purely so each print is visibly pushed past
  * the tear bar -- not part of escpos_format()'s tested output. */
 #define PRINT_EXTRA_FEED_LINES 8
@@ -90,24 +101,59 @@ static void build_demo_checkerboard(void)
     s_demo_bitmap_built = true;
 }
 
+/* Width-test pattern (see ENABLE_WIDTH_TEST_DEMO): 8 alternating vertical
+ * stripes, each STRIPE_WIDTH_PX wide, spanning the full candidate width.
+ * If the candidate width is actually printable edge-to-edge, all 8 stripes
+ * appear with no clipping/wraparound. */
+#define WIDTH_TEST_REF          "demo-width-test"
+#define WIDTH_TEST_WIDTH_PX     576
+#define WIDTH_TEST_WIDTH_BYTES  (WIDTH_TEST_WIDTH_PX / 8)
+#define WIDTH_TEST_HEIGHT_PX    64
+#define WIDTH_TEST_NUM_STRIPES  8
+#define WIDTH_TEST_STRIPE_BYTES (WIDTH_TEST_WIDTH_BYTES / WIDTH_TEST_NUM_STRIPES)
+
+static uint8_t s_width_test_bitmap[WIDTH_TEST_WIDTH_BYTES * WIDTH_TEST_HEIGHT_PX];
+static bool s_width_test_bitmap_built;
+
+static void build_width_test_stripes(void)
+{
+    for (size_t row = 0; row < WIDTH_TEST_HEIGHT_PX; row++) {
+        for (size_t col_byte = 0; col_byte < WIDTH_TEST_WIDTH_BYTES; col_byte++) {
+            size_t stripe_index = col_byte / WIDTH_TEST_STRIPE_BYTES;
+            bool black = (stripe_index % 2) == 0;
+            s_width_test_bitmap[row * WIDTH_TEST_WIDTH_BYTES + col_byte] = black ? 0xFF : 0x00;
+        }
+    }
+    s_width_test_bitmap_built = true;
+}
+
 /* Returns false (unresolvable reference) rather than crashing/asserting --
  * a real fetch (M25) can fail just as easily (network error, expired
  * reference, 404), so the caller already has to handle this path. */
 static bool resolve_image_reference(const char *ref, size_t ref_len, const uint8_t **out_bitmap,
                                      size_t *out_width_bytes, size_t *out_height_px)
 {
-    if (ref_len != strlen(DEMO_IMAGE_REF) || memcmp(ref, DEMO_IMAGE_REF, ref_len) != 0) {
-        return false;
+    if (ref_len == strlen(DEMO_IMAGE_REF) && memcmp(ref, DEMO_IMAGE_REF, ref_len) == 0) {
+        if (!s_demo_bitmap_built) {
+            build_demo_checkerboard();
+        }
+        *out_bitmap = s_demo_bitmap;
+        *out_width_bytes = DEMO_IMAGE_WIDTH_BYTES;
+        *out_height_px = DEMO_IMAGE_HEIGHT_PX;
+        return true;
     }
 
-    if (!s_demo_bitmap_built) {
-        build_demo_checkerboard();
+    if (ref_len == strlen(WIDTH_TEST_REF) && memcmp(ref, WIDTH_TEST_REF, ref_len) == 0) {
+        if (!s_width_test_bitmap_built) {
+            build_width_test_stripes();
+        }
+        *out_bitmap = s_width_test_bitmap;
+        *out_width_bytes = WIDTH_TEST_WIDTH_BYTES;
+        *out_height_px = WIDTH_TEST_HEIGHT_PX;
+        return true;
     }
 
-    *out_bitmap = s_demo_bitmap;
-    *out_width_bytes = DEMO_IMAGE_WIDTH_BYTES;
-    *out_height_px = DEMO_IMAGE_HEIGHT_PX;
-    return true;
+    return false;
 }
 
 static const char *TAG = "usb_printer_host";
@@ -261,6 +307,10 @@ static void action_get_config_desc(tracked_device_t *dev)
 
 #if ENABLE_IMAGE_DEMO
     usb_printer_host_enqueue_image(DEMO_IMAGE_REF, strlen(DEMO_IMAGE_REF));
+#endif
+
+#if ENABLE_WIDTH_TEST_DEMO
+    usb_printer_host_enqueue_image(WIDTH_TEST_REF, strlen(WIDTH_TEST_REF));
 #endif
 }
 
