@@ -454,10 +454,28 @@ static bool stream_server_image(const image_job_info_t *info, bool cut_after)
     while (rows_remaining > 0 && ok) {
         size_t band_height = rows_remaining < IMAGE_STREAM_BAND_HEIGHT_PX ? rows_remaining : IMAGE_STREAM_BAND_HEIGHT_PX;
         size_t band_remaining = band_height * info->width_bytes;
+        bool is_first_band = (rows_remaining == info->height_px);
 
         uint8_t header_buf[ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN];
         size_t header_len = escpos_format_raster_header(info->width_bytes, band_height, header_buf, sizeof(header_buf));
-        if (header_len == 0 || !send_chunk_blocking(header_buf, header_len)) {
+        if (header_len == 0) {
+            ESP_LOGE(TAG, "Failed to format image stream band header");
+            ok = false;
+            break;
+        }
+
+        /* escpos_format_raster_header() always prepends ESC @ (initialize
+         * printer) before the GS v 0 header -- correct for a one-shot
+         * image, but re-sending ESC @ before every band resets printer
+         * modes between bands, which breaks the continuous raster print
+         * into visibly disjointed strips at each band boundary (correct
+         * total bytes/length, wrong layout -- "small garbled lines"
+         * instead of one continuous image). Only the first band needs it;
+         * later bands send just the GS v 0 header, continuing directly
+         * from wherever the previous band's raster data left off. */
+        const uint8_t *header_send_buf = is_first_band ? header_buf : header_buf + ESCPOS_CMD_INIT_LEN;
+        size_t header_send_len = is_first_band ? header_len : header_len - ESCPOS_CMD_INIT_LEN;
+        if (!send_chunk_blocking(header_send_buf, header_send_len)) {
             ESP_LOGE(TAG, "Failed to send image stream band header");
             ok = false;
             break;
