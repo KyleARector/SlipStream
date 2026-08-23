@@ -78,6 +78,17 @@
 #define ESCPOS_CUT_FULL_LEN 3
 static const uint8_t k_escpos_cut_full[ESCPOS_CUT_FULL_LEN] = {0x1D, 0x56, 0x00};
 
+/* ESC @ -- initialize printer. Used as a recovery command: if a streamed
+ * image aborts partway through (see stream_server_image()'s failure paths),
+ * the printer has already been told via GS v 0's header how many raster
+ * bytes to expect and won't leave raster mode until it receives that many --
+ * otherwise it keeps swallowing everything printed afterward (including the
+ * next job's own init sequence and text) as pixel data, producing garbled
+ * output far longer than any single job's content. ESC @ forces the printer
+ * back to a clean state regardless of what raster byte count it still
+ * thinks it's owed. */
+static const uint8_t k_escpos_init[ESCPOS_CMD_INIT_LEN] = {0x1B, 0x40};
+
 static const char *TAG = "usb_printer_host";
 
 /* Image job "reference resolution" (M24): the queue only ever carries a
@@ -448,6 +459,14 @@ static bool stream_server_image(const image_job_info_t *info, bool cut_after)
     esp_http_client_cleanup(client);
 
     if (!ok) {
+        /* The printer already received the GS v 0 header promising
+         * total_len raster bytes but got fewer than that -- force it out
+         * of raster mode now rather than leaving it to misinterpret
+         * whatever prints next as leftover pixel data. Best-effort: if
+         * this transfer also fails, there's nothing further to do. */
+        ESP_LOGW(TAG, "Image stream aborted with %u bytes remaining, resetting printer to recover from raster mode",
+                 (unsigned)remaining);
+        send_chunk_blocking(k_escpos_init, ESCPOS_CMD_INIT_LEN);
         return false;
     }
 
@@ -698,6 +717,8 @@ static void start_next_print_job(void)
     }
 
     print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_START);
+    ESP_LOGI(TAG, "Starting print job: type=%d cut_after=%d payload_len=%u payload=\"%.*s\"", (int)job.type,
+             (int)job.cut_after, (unsigned)job.payload_len, (int)job.payload_len, job.payload);
 
     image_job_info_t image_info;
     if (job.type == PRINT_JOB_TYPE_IMAGE) {

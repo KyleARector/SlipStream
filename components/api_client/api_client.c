@@ -63,6 +63,8 @@ static void handle_checkin_response(const char *json_str)
              * before. See usb_printer_host_enqueue_print()'s doc comment. */
             cJSON *cut_after_json = cJSON_GetObjectItemCaseSensitive(job, "cut_after");
             bool cut_after = !cJSON_IsBool(cut_after_json) || cJSON_IsTrue(cut_after_json);
+            ESP_LOGI(TAG, "Parsed job type=%s cut_after=%d (field present=%d)", type->valuestring, (int)cut_after,
+                     (int)cJSON_IsBool(cut_after_json));
 
             if (strcmp(type->valuestring, "text") == 0) {
                 cJSON *text = cJSON_GetObjectItemCaseSensitive(job, "text");
