@@ -78,3 +78,42 @@ size_t escpos_format_sized(const char *text, size_t text_len, uint8_t width_mult
 
     return offset;
 }
+
+size_t escpos_format_raster(const uint8_t *bitmap_data, size_t width_bytes, size_t height_px, uint8_t *out_buf,
+                             size_t out_buf_capacity)
+{
+    if (out_buf == NULL || bitmap_data == NULL) {
+        return 0;
+    }
+    if (width_bytes == 0 || width_bytes > 0xFFFF || height_px == 0 || height_px > 0xFFFF) {
+        return 0;
+    }
+
+    size_t data_len = width_bytes * height_px;
+    size_t total_len = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + data_len;
+    if (total_len > out_buf_capacity) {
+        return 0;
+    }
+
+    uint8_t header[ESCPOS_CMD_RASTER_HEADER_LEN] = {
+        0x1D, 0x76, 0x30, 0x00, /* GS v 0, mode 0 (normal) */
+        (uint8_t)(width_bytes & 0xFF), (uint8_t)((width_bytes >> 8) & 0xFF),
+        (uint8_t)(height_px & 0xFF), (uint8_t)((height_px >> 8) & 0xFF),
+    };
+
+    size_t offset = 0;
+
+    memcpy(out_buf + offset, k_init_cmd, ESCPOS_CMD_INIT_LEN);
+    offset += ESCPOS_CMD_INIT_LEN;
+
+    memcpy(out_buf + offset, header, ESCPOS_CMD_RASTER_HEADER_LEN);
+    offset += ESCPOS_CMD_RASTER_HEADER_LEN;
+
+    memcpy(out_buf + offset, bitmap_data, data_len);
+    offset += data_len;
+
+    memcpy(out_buf + offset, k_trailer, ESCPOS_TRAILER_LEN);
+    offset += ESCPOS_TRAILER_LEN;
+
+    return offset;
+}

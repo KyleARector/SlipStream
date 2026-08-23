@@ -31,6 +31,15 @@ esp_err_t usb_printer_host_start(void);
  * a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */
 esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len);
 
+/* Enqueues an image job carrying only a reference/handle string, not image
+ * bytes (M24) -- the actual bitmap is resolved when the job is dequeued for
+ * printing, since image payloads don't fit a queue slot sized for text.
+ * Same safety/handoff guarantees as usb_printer_host_enqueue_print().
+ *
+ * Returns ESP_ERR_INVALID_ARG if image_ref is NULL or image_ref_len is too
+ * long for a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */
+esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len);
+
 /* True when there's no incoming/queued/in-flight print job anywhere in the
  * pipeline (the handoff queue, the pure-logic print_job_queue, and the FSM
  * itself are all idle). A single volatile flag, computed and written only

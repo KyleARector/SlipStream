@@ -40,11 +40,27 @@ print_job_state_t print_job_fsm_get_state(const print_job_fsm_t *fsm);
  * otherwise (illegal transitions are rejected, never crash). */
 bool print_job_fsm_handle_event(print_job_fsm_t *fsm, print_job_event_t event);
 
+/* A job is either printable text, or a reference/handle to an image the
+ * hardware-glue layer resolves to actual bitmap bytes when the job is
+ * dequeued (M24) -- image payloads don't fit a queue slot sized for text,
+ * so the queue only ever carries the reference, never image bytes
+ * themselves. The queue treats both the same opaque way (push/pop don't
+ * branch on type), which is what keeps this a single, type-agnostic
+ * fixed-size FIFO instead of two parallel queues. */
+typedef enum {
+    PRINT_JOB_TYPE_TEXT = 0,
+    PRINT_JOB_TYPE_IMAGE,
+} print_job_type_t;
+
 /* FIFO queue of pending print jobs, decoupled from the FSM itself so
  * incoming messages can queue up while one job is mid-flight. */
 typedef struct {
-    char text[PRINT_JOB_TEXT_MAX_LEN];
-    size_t text_len;
+    print_job_type_t type;
+    /* Text content (PRINT_JOB_TYPE_TEXT), or an image reference/handle
+     * string (PRINT_JOB_TYPE_IMAGE) -- same storage either way, since a
+     * reference is just another short string. */
+    char payload[PRINT_JOB_TEXT_MAX_LEN];
+    size_t payload_len;
 } print_job_t;
 
 typedef struct {
@@ -58,10 +74,10 @@ bool print_job_queue_is_empty(const print_job_queue_t *queue);
 bool print_job_queue_is_full(const print_job_queue_t *queue);
 size_t print_job_queue_count(const print_job_queue_t *queue);
 
-/* Copies text (text_len bytes, not required to be NUL-terminated) into a
- * new queue slot. Fails if the queue is full or text_len is too long for
- * PRINT_JOB_TEXT_MAX_LEN. */
-bool print_job_queue_push(print_job_queue_t *queue, const char *text, size_t text_len);
+/* Copies payload (payload_len bytes, not required to be NUL-terminated)
+ * into a new queue slot tagged with type. Fails if the queue is full or
+ * payload_len is too long for PRINT_JOB_TEXT_MAX_LEN. */
+bool print_job_queue_push(print_job_queue_t *queue, print_job_type_t type, const char *payload, size_t payload_len);
 
 /* Pops the oldest job into *out_job (if non-NULL). Fails if empty. */
 bool print_job_queue_pop(print_job_queue_t *queue, print_job_t *out_job);

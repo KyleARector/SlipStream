@@ -37,6 +37,15 @@
  * hardware. Off by default, same reasoning as ENABLE_QUEUE_DEMO above. */
 #define ENABLE_TEXT_SIZE_DEMO 0
 
+/* M24 image demo: set to 1 to enqueue one hardcoded test bitmap once the
+ * printer is ready. Unlike the text-size demo, this goes through the real
+ * usb_printer_host_enqueue_image() -> queue -> FSM path (M24's acceptance
+ * criterion is specifically that an image job prints via the *same* queue
+ * path as text jobs, no bypass), proving the whole image plumbing works
+ * end to end, not just the formatter in isolation. Off by default, same
+ * reasoning as the other demo flags. */
+#define ENABLE_IMAGE_DEMO 0
+
 /* Extra trailing feed lines purely so each print is visibly pushed past
  * the tear bar -- not part of escpos_format()'s tested output. */
 #define PRINT_EXTRA_FEED_LINES 8
@@ -45,6 +54,61 @@
  * appended here per job as a separate, deliberate addition. */
 #define ESCPOS_CUT_FULL_LEN 3
 static const uint8_t k_escpos_cut_full[ESCPOS_CUT_FULL_LEN] = {0x1D, 0x56, 0x00};
+
+/* Image job "reference resolution" (M24): the queue only ever carries a
+ * reference string, never bitmap bytes (see print_job_fsm.h); this is
+ * where a reference gets turned into actual pixels, right before
+ * printing. For now this only recognizes one hardcoded demo reference and
+ * serves a procedurally-generated checkerboard from RAM -- M25 replaces
+ * this lookup with an HTTP fetch from the server, keyed by the same kind
+ * of reference string, without needing to touch the queue/FSM again.
+ *
+ * Deliberately narrow (64px, 8 bytes/row): the TM-H2000's actual full
+ * print width in dots is unconfirmed (see the Phase 2 spec's open item on
+ * this) -- picking a small, arbitrary width here avoids baking in a wrong
+ * assumption about the real printable width before that's verified. */
+#define DEMO_IMAGE_REF          "demo-checkerboard"
+#define DEMO_IMAGE_WIDTH_PX     64
+#define DEMO_IMAGE_WIDTH_BYTES  (DEMO_IMAGE_WIDTH_PX / 8)
+#define DEMO_IMAGE_HEIGHT_PX    32
+#define DEMO_IMAGE_BLOCK_PX     8
+
+static uint8_t s_demo_bitmap[DEMO_IMAGE_WIDTH_BYTES * DEMO_IMAGE_HEIGHT_PX];
+static bool s_demo_bitmap_built;
+
+static void build_demo_checkerboard(void)
+{
+    for (size_t row = 0; row < DEMO_IMAGE_HEIGHT_PX; row++) {
+        size_t block_row = row / DEMO_IMAGE_BLOCK_PX;
+        for (size_t col_byte = 0; col_byte < DEMO_IMAGE_WIDTH_BYTES; col_byte++) {
+            /* Each byte is exactly one 8px-wide checkerboard block, since
+             * DEMO_IMAGE_BLOCK_PX == 8 bits per byte. */
+            bool black = ((block_row + col_byte) % 2) == 0;
+            s_demo_bitmap[row * DEMO_IMAGE_WIDTH_BYTES + col_byte] = black ? 0xFF : 0x00;
+        }
+    }
+    s_demo_bitmap_built = true;
+}
+
+/* Returns false (unresolvable reference) rather than crashing/asserting --
+ * a real fetch (M25) can fail just as easily (network error, expired
+ * reference, 404), so the caller already has to handle this path. */
+static bool resolve_image_reference(const char *ref, size_t ref_len, const uint8_t **out_bitmap,
+                                     size_t *out_width_bytes, size_t *out_height_px)
+{
+    if (ref_len != strlen(DEMO_IMAGE_REF) || memcmp(ref, DEMO_IMAGE_REF, ref_len) != 0) {
+        return false;
+    }
+
+    if (!s_demo_bitmap_built) {
+        build_demo_checkerboard();
+    }
+
+    *out_bitmap = s_demo_bitmap;
+    *out_width_bytes = DEMO_IMAGE_WIDTH_BYTES;
+    *out_height_px = DEMO_IMAGE_HEIGHT_PX;
+    return true;
+}
 
 static const char *TAG = "usb_printer_host";
 
@@ -65,10 +129,12 @@ typedef struct {
 /* Message handed off from any other task into the print job queue via a
  * FreeRTOS queue. Per the spec's Concurrency Model, nothing outside
  * enum_task ever touches print_job_queue_t/print_job_fsm_t directly --
- * everyone else goes through usb_printer_host_enqueue_print(). */
+ * everyone else goes through usb_printer_host_enqueue_print() /
+ * usb_printer_host_enqueue_image(). */
 typedef struct {
-    char text[PRINT_JOB_TEXT_MAX_LEN];
-    size_t text_len;
+    print_job_type_t type;
+    char payload[PRINT_JOB_TEXT_MAX_LEN];
+    size_t payload_len;
 } incoming_job_msg_t;
 
 typedef struct {
@@ -191,6 +257,10 @@ static void action_get_config_desc(tracked_device_t *dev)
 
 #if ENABLE_TEXT_SIZE_DEMO
     print_text_size_demo();
+#endif
+
+#if ENABLE_IMAGE_DEMO
+    usb_printer_host_enqueue_image(DEMO_IMAGE_REF, strlen(DEMO_IMAGE_REF));
 #endif
 }
 
@@ -317,30 +387,58 @@ static void start_next_print_job(void)
 
     print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_START);
 
-    uint8_t frame[ESCPOS_FRAME_OVERHEAD_LEN + job.text_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN];
-    size_t frame_len = escpos_format(job.text, job.text_len, frame, sizeof(frame));
-    if (frame_len == 0) {
-        ESP_LOGE(TAG, "escpos_format() failed to produce output for queued job");
-        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
-        return;
-    }
-    print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
+    /* Image bytes can be far larger than text (up to a full raster banner
+     * in later milestones), so the frame is built directly into the
+     * transfer's own heap-allocated data_buffer rather than staged in a
+     * local array first -- enum_task's stack (ENUM_TASK_STACK_SIZE) is
+     * sized for small text jobs, not for holding a whole image frame
+     * twice over. */
+    const uint8_t *bitmap = NULL;
+    size_t bitmap_width_bytes = 0;
+    size_t bitmap_height_px = 0;
+    size_t frame_capacity;
 
-    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
-        frame[frame_len++] = '\n';
+    if (job.type == PRINT_JOB_TYPE_TEXT) {
+        frame_capacity = ESCPOS_FRAME_OVERHEAD_LEN + job.payload_len + PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
+    } else {
+        if (!resolve_image_reference(job.payload, job.payload_len, &bitmap, &bitmap_width_bytes, &bitmap_height_px)) {
+            ESP_LOGE(TAG, "Unable to resolve image reference: %.*s", (int)job.payload_len, job.payload);
+            print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+            return;
+        }
+        frame_capacity = ESCPOS_RASTER_FRAME_OVERHEAD_LEN + (bitmap_width_bytes * bitmap_height_px) +
+                          PRINT_EXTRA_FEED_LINES + ESCPOS_CUT_FULL_LEN;
     }
-    memcpy(&frame[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
-    frame_len += ESCPOS_CUT_FULL_LEN;
 
     usb_transfer_t *transfer = NULL;
-    esp_err_t err = usb_host_transfer_alloc(frame_len, 0, &transfer);
+    esp_err_t err = usb_host_transfer_alloc(frame_capacity, 0, &transfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate print transfer: %s", esp_err_to_name(err));
         print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
         return;
     }
 
-    memcpy(transfer->data_buffer, frame, frame_len);
+    size_t frame_len;
+    if (job.type == PRINT_JOB_TYPE_TEXT) {
+        frame_len = escpos_format(job.payload, job.payload_len, transfer->data_buffer, frame_capacity);
+    } else {
+        frame_len =
+            escpos_format_raster(bitmap, bitmap_width_bytes, bitmap_height_px, transfer->data_buffer, frame_capacity);
+    }
+    if (frame_len == 0) {
+        ESP_LOGE(TAG, "escpos formatter failed to produce output for queued job");
+        usb_host_transfer_free(transfer);
+        print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
+        return;
+    }
+    print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_FORMATTED);
+
+    for (int i = 0; i < PRINT_EXTRA_FEED_LINES; i++) {
+        transfer->data_buffer[frame_len++] = '\n';
+    }
+    memcpy(&transfer->data_buffer[frame_len], k_escpos_cut_full, ESCPOS_CUT_FULL_LEN);
+    frame_len += ESCPOS_CUT_FULL_LEN;
+
     transfer->num_bytes = (int)frame_len;
     transfer->device_handle = s_driver.printer_dev_hdl;
     transfer->bEndpointAddress = s_driver.printer_bulk_out_ep;
@@ -405,14 +503,15 @@ static void print_text_size_demo(void)
 }
 #endif
 
-/* Drains anything handed off via usb_printer_host_enqueue_print() into the
- * pure-logic queue. Only enum_task ever calls print_job_queue_push(). */
+/* Drains anything handed off via usb_printer_host_enqueue_print() /
+ * usb_printer_host_enqueue_image() into the pure-logic queue. Only
+ * enum_task ever calls print_job_queue_push(). */
 static void drain_incoming_jobs(void)
 {
     incoming_job_msg_t msg;
     while (xQueueReceive(s_incoming_jobs, &msg, 0) == pdTRUE) {
-        if (!print_job_queue_push(&s_driver.print_queue, msg.text, msg.text_len)) {
-            ESP_LOGW(TAG, "Print job queue full, dropping job: %.*s", (int)msg.text_len, msg.text);
+        if (!print_job_queue_push(&s_driver.print_queue, msg.type, msg.payload, msg.payload_len)) {
+            ESP_LOGW(TAG, "Print job queue full, dropping job: %.*s", (int)msg.payload_len, msg.payload);
         }
     }
 }
@@ -453,8 +552,26 @@ esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len)
     }
 
     incoming_job_msg_t msg;
-    memcpy(msg.text, text, text_len);
-    msg.text_len = text_len;
+    msg.type = PRINT_JOB_TYPE_TEXT;
+    memcpy(msg.payload, text, text_len);
+    msg.payload_len = text_len;
+
+    if (xQueueSend(s_incoming_jobs, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t usb_printer_host_enqueue_image(const char *image_ref, size_t image_ref_len)
+{
+    if (image_ref == NULL || image_ref_len >= PRINT_JOB_TEXT_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    incoming_job_msg_t msg;
+    msg.type = PRINT_JOB_TYPE_IMAGE;
+    memcpy(msg.payload, image_ref, image_ref_len);
+    msg.payload_len = image_ref_len;
 
     if (xQueueSend(s_incoming_jobs, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;

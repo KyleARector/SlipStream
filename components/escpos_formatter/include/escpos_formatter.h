@@ -65,6 +65,35 @@ size_t escpos_format(const char *text, size_t text_len, uint8_t *out_buf, size_t
 size_t escpos_format_sized(const char *text, size_t text_len, uint8_t width_mult, uint8_t height_mult,
                             uint8_t *out_buf, size_t out_buf_capacity);
 
+/* ESC/POS "print raster bit image" command header: GS v 0 m xL xH yL yH
+ * (the bitmap data itself follows separately, not counted in this length). */
+#define ESCPOS_CMD_RASTER_HEADER_LEN 8
+
+/* init + GS v 0 header + trailing LF (bitmap data length is added by the
+ * caller: width_bytes * height_px). */
+#define ESCPOS_RASTER_FRAME_OVERHEAD_LEN (ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN + ESCPOS_TRAILER_LEN)
+
+/* Formats a pre-rendered 1-bit-per-pixel bitmap into an ESC/POS byte
+ * stream: init sequence + GS v 0 raster header + bitmap data verbatim +
+ * one trailing line feed.
+ *
+ * bitmap_data must already be in the exact format GS v 0 expects: MSB-first
+ * packed bits, one row after another, each row exactly width_bytes bytes
+ * (so a width not a multiple of 8 is padded to the next byte boundary by
+ * whoever produced the bitmap -- this formatter does no bit-packing or
+ * padding itself). Per the spec's architecture decision, rendering
+ * (dithering, scaling, packing) happens server-side; this formatter's only
+ * job is wrapping already-correct bytes in the right command, mirroring
+ * escpos_format_sized()'s relationship to GS !.
+ *
+ * width_bytes and height_px must each be in [1, 0xFFFF] (GS v 0's header
+ * fields are 16-bit); bitmap_data must be non-NULL and exactly
+ * width_bytes * height_px bytes long. Writes at most out_buf_capacity
+ * bytes to out_buf. Returns the number of bytes written on success, or 0
+ * if out_buf is too small or any argument is invalid. */
+size_t escpos_format_raster(const uint8_t *bitmap_data, size_t width_bytes, size_t height_px, uint8_t *out_buf,
+                             size_t out_buf_capacity);
+
 #ifdef __cplusplus
 }
 #endif

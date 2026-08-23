@@ -185,26 +185,45 @@ static void test_queue_push_pop_fifo_order(void)
     print_job_queue_t q;
     print_job_queue_init(&q);
 
-    TEST_ASSERT_TRUE(print_job_queue_push(&q, "first", 5));
-    TEST_ASSERT_TRUE(print_job_queue_push(&q, "second", 6));
-    TEST_ASSERT_TRUE(print_job_queue_push(&q, "third", 5));
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "first", 5));
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "second", 6));
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "third", 5));
     TEST_ASSERT_EQUAL_UINT(3, print_job_queue_count(&q));
 
     print_job_t job;
 
     TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
-    TEST_ASSERT_EQUAL_UINT(5, job.text_len);
-    TEST_ASSERT_EQUAL_STRING("first", job.text);
+    TEST_ASSERT_EQUAL_UINT(5, job.payload_len);
+    TEST_ASSERT_EQUAL_STRING("first", job.payload);
 
     TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
-    TEST_ASSERT_EQUAL_UINT(6, job.text_len);
-    TEST_ASSERT_EQUAL_STRING("second", job.text);
+    TEST_ASSERT_EQUAL_UINT(6, job.payload_len);
+    TEST_ASSERT_EQUAL_STRING("second", job.payload);
 
     TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
-    TEST_ASSERT_EQUAL_UINT(5, job.text_len);
-    TEST_ASSERT_EQUAL_STRING("third", job.text);
+    TEST_ASSERT_EQUAL_UINT(5, job.payload_len);
+    TEST_ASSERT_EQUAL_STRING("third", job.payload);
 
     TEST_ASSERT_TRUE(print_job_queue_is_empty(&q));
+}
+
+static void test_queue_preserves_job_type(void)
+{
+    print_job_queue_t q;
+    print_job_queue_init(&q);
+
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "hello", 5));
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_IMAGE, "image-ref-42", 12));
+
+    print_job_t job;
+
+    TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
+    TEST_ASSERT_EQUAL_INT(PRINT_JOB_TYPE_TEXT, job.type);
+    TEST_ASSERT_EQUAL_STRING("hello", job.payload);
+
+    TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
+    TEST_ASSERT_EQUAL_INT(PRINT_JOB_TYPE_IMAGE, job.type);
+    TEST_ASSERT_EQUAL_STRING("image-ref-42", job.payload);
 }
 
 static void test_queue_push_rejects_when_full(void)
@@ -213,10 +232,10 @@ static void test_queue_push_rejects_when_full(void)
     print_job_queue_init(&q);
 
     for (int i = 0; i < PRINT_JOB_QUEUE_CAPACITY; i++) {
-        TEST_ASSERT_TRUE(print_job_queue_push(&q, "x", 1));
+        TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "x", 1));
     }
     TEST_ASSERT_TRUE(print_job_queue_is_full(&q));
-    TEST_ASSERT_FALSE(print_job_queue_push(&q, "overflow", 8));
+    TEST_ASSERT_FALSE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "overflow", 8));
     TEST_ASSERT_EQUAL_UINT(PRINT_JOB_QUEUE_CAPACITY, print_job_queue_count(&q));
 }
 
@@ -237,7 +256,7 @@ static void test_queue_push_rejects_text_too_long(void)
     char too_long[PRINT_JOB_TEXT_MAX_LEN + 1];
     memset(too_long, 'a', sizeof(too_long));
 
-    TEST_ASSERT_FALSE(print_job_queue_push(&q, too_long, sizeof(too_long)));
+    TEST_ASSERT_FALSE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, too_long, sizeof(too_long)));
     TEST_ASSERT_TRUE(print_job_queue_is_empty(&q));
 }
 
@@ -251,19 +270,19 @@ static void test_queue_wraparound(void)
     for (int round = 0; round < PRINT_JOB_QUEUE_CAPACITY * 3; round++) {
         char text[8];
         int len = snprintf(text, sizeof(text), "m%d", round);
-        TEST_ASSERT_TRUE(print_job_queue_push(&q, text, (size_t)len));
+        TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, text, (size_t)len));
 
         print_job_t job;
         TEST_ASSERT_TRUE(print_job_queue_pop(&q, &job));
-        TEST_ASSERT_EQUAL_UINT((size_t)len, job.text_len);
-        TEST_ASSERT_EQUAL_STRING(text, job.text);
+        TEST_ASSERT_EQUAL_UINT((size_t)len, job.payload_len);
+        TEST_ASSERT_EQUAL_STRING(text, job.payload);
     }
     TEST_ASSERT_TRUE(print_job_queue_is_empty(&q));
 }
 
 static void test_queue_null_pointer_safety(void)
 {
-    TEST_ASSERT_FALSE(print_job_queue_push(NULL, "x", 1));
+    TEST_ASSERT_FALSE(print_job_queue_push(NULL, PRINT_JOB_TYPE_TEXT, "x", 1));
     TEST_ASSERT_FALSE(print_job_queue_pop(NULL, NULL));
     TEST_ASSERT_TRUE(print_job_queue_is_empty(NULL));
     TEST_ASSERT_FALSE(print_job_queue_is_full(NULL));
@@ -271,10 +290,10 @@ static void test_queue_null_pointer_safety(void)
 
     print_job_queue_t q;
     print_job_queue_init(&q);
-    TEST_ASSERT_FALSE(print_job_queue_push(&q, NULL, 1));
+    TEST_ASSERT_FALSE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, NULL, 1));
 
     /* pop with a NULL out_job still advances the queue, just discards the value. */
-    TEST_ASSERT_TRUE(print_job_queue_push(&q, "x", 1));
+    TEST_ASSERT_TRUE(print_job_queue_push(&q, PRINT_JOB_TYPE_TEXT, "x", 1));
     TEST_ASSERT_TRUE(print_job_queue_pop(&q, NULL));
     TEST_ASSERT_TRUE(print_job_queue_is_empty(&q));
 }
@@ -293,6 +312,7 @@ int main(void)
 
     RUN_TEST(test_queue_init_is_empty);
     RUN_TEST(test_queue_push_pop_fifo_order);
+    RUN_TEST(test_queue_preserves_job_type);
     RUN_TEST(test_queue_push_rejects_when_full);
     RUN_TEST(test_queue_pop_rejects_when_empty);
     RUN_TEST(test_queue_push_rejects_text_too_long);
