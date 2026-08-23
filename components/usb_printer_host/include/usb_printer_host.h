@@ -18,9 +18,15 @@ extern "C" {
  * print job FSM/queue from components/print_job_fsm -- see
  * usb_printer_host_enqueue_print().
  *
+ * server_url and api_key (from secrets.h) are used to fetch real image job
+ * bytes from GET {server_url}/images/{image_ref} (M25) when a queued image
+ * job is dequeued -- must stay valid for the life of the program; pass the
+ * string-literal constants directly, same convention as
+ * api_client_start(). Only main.c ever touches secrets.h.
+ *
  * Returns once the background tasks are created; enumeration happens
  * asynchronously and continues for the lifetime of the app. */
-esp_err_t usb_printer_host_start(void);
+esp_err_t usb_printer_host_start(const char *server_url, const char *api_key);
 
 /* Enqueues text as a print job. Safe to call from any task or context --
  * hands off via a FreeRTOS queue to the single task that owns the print
@@ -35,6 +41,12 @@ esp_err_t usb_printer_host_enqueue_print(const char *text, size_t text_len);
  * bytes (M24) -- the actual bitmap is resolved when the job is dequeued for
  * printing, since image payloads don't fit a queue slot sized for text.
  * Same safety/handoff guarantees as usb_printer_host_enqueue_print().
+ *
+ * image_ref must be either one of the built-in demo reference strings, or
+ * "{image_ref}:{width_dots}x{height_dots}" (M25) -- the exact encoding
+ * api_client builds from a check-in response's image job fields, so the
+ * dequeue-time fetch knows how many bytes to read without a second
+ * round-trip just to ask the size.
  *
  * Returns ESP_ERR_INVALID_ARG if image_ref is NULL or image_ref_len is too
  * long for a single job, ESP_ERR_TIMEOUT if the handoff queue is full. */

@@ -1,3 +1,3 @@
 idf_component_register(SRCS "usb_printer_host.c"
                         INCLUDE_DIRS "include"
-                        PRIV_REQUIRES usb escpos_formatter print_job_fsm)
+                        PRIV_REQUIRES usb escpos_formatter print_job_fsm esp_http_client mbedtls)

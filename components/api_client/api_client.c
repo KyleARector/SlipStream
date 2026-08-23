@@ -51,27 +51,62 @@ static void handle_checkin_response(const char *json_str)
         cJSON *job;
         cJSON_ArrayForEach(job, job_array) {
             cJSON *type = cJSON_GetObjectItemCaseSensitive(job, "type");
-            cJSON *text = cJSON_GetObjectItemCaseSensitive(job, "text");
-            if (!cJSON_IsString(type) || !cJSON_IsString(text)) {
+            if (!cJSON_IsString(type)) {
                 ESP_LOGW(TAG, "Skipping malformed job entry in check-in response");
                 continue;
             }
-            if (strcmp(type->valuestring, "text") != 0) {
-                /* Image jobs aren't wired up until firmware M24. */
-                ESP_LOGW(TAG, "Skipping unsupported job type \"%s\"", type->valuestring);
+
+            if (strcmp(type->valuestring, "text") == 0) {
+                cJSON *text = cJSON_GetObjectItemCaseSensitive(job, "text");
+                if (!cJSON_IsString(text)) {
+                    ESP_LOGW(TAG, "Skipping malformed text job entry");
+                    continue;
+                }
+
+                size_t len = strlen(text->valuestring);
+                ESP_LOGI(TAG, "Enqueuing print job from server (%u bytes)", (unsigned)len);
+
+                /* Safe to call from any task -- hands off via its own
+                 * FreeRTOS queue rather than touching the print job
+                 * FSM/queue directly (see M8's Concurrency Model note;
+                 * same entry point BLE uses). */
+                esp_err_t print_err = usb_printer_host_enqueue_print(text->valuestring, len);
+                if (print_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to enqueue server print job: %s", esp_err_to_name(print_err));
+                }
                 continue;
             }
 
-            size_t len = strlen(text->valuestring);
-            ESP_LOGI(TAG, "Enqueuing print job from server (%u bytes)", (unsigned)len);
+            if (strcmp(type->valuestring, "image") == 0) {
+                cJSON *image_ref = cJSON_GetObjectItemCaseSensitive(job, "image_ref");
+                cJSON *width_dots = cJSON_GetObjectItemCaseSensitive(job, "width_dots");
+                cJSON *height_dots = cJSON_GetObjectItemCaseSensitive(job, "height_dots");
+                if (!cJSON_IsString(image_ref) || !cJSON_IsNumber(width_dots) || !cJSON_IsNumber(height_dots)) {
+                    ESP_LOGW(TAG, "Skipping malformed image job entry");
+                    continue;
+                }
 
-            /* Safe to call from any task -- hands off via its own FreeRTOS
-             * queue rather than touching the print job FSM/queue directly
-             * (see M8's Concurrency Model note; same entry point BLE uses). */
-            esp_err_t print_err = usb_printer_host_enqueue_print(text->valuestring, len);
-            if (print_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to enqueue server print job: %s", esp_err_to_name(print_err));
+                /* usb_printer_host resolves this exact encoding at dequeue
+                 * time by fetching GET {server}/images/{image_ref} -- see
+                 * usb_printer_host_enqueue_image()'s doc comment. */
+                char encoded_ref[96];
+                int written = snprintf(encoded_ref, sizeof(encoded_ref), "%s:%dx%d", image_ref->valuestring,
+                                        width_dots->valueint, height_dots->valueint);
+                if (written < 0 || (size_t)written >= sizeof(encoded_ref)) {
+                    ESP_LOGW(TAG, "Image job reference too long to encode, skipping");
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "Enqueuing image job from server (%dx%d dots)", width_dots->valueint,
+                         height_dots->valueint);
+                esp_err_t print_err = usb_printer_host_enqueue_image(encoded_ref, (size_t)written);
+                if (print_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to enqueue server image job: %s", esp_err_to_name(print_err));
+                }
+                continue;
             }
+
+            ESP_LOGW(TAG, "Skipping unsupported job type \"%s\"", type->valuestring);
         }
     }
 

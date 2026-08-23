@@ -21,7 +21,7 @@ void app_main(void)
     ESP_LOGI(TAG, " ESP-IDF: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "================================================");
 
-    ESP_ERROR_CHECK(usb_printer_host_start());
+    ESP_ERROR_CHECK(usb_printer_host_start(API_SERVER_URL, API_KEY));
     ESP_ERROR_CHECK(ble_peripheral_start());
     ESP_ERROR_CHECK(wifi_sta_start());
     ESP_ERROR_CHECK(api_client_start(API_SERVER_URL, API_KEY));

@@ -1,7 +1,11 @@
 #include "usb_printer_host.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "escpos_formatter.h"
@@ -16,7 +20,16 @@
 #define HOST_LIB_TASK_PRIORITY   2
 #define ENUM_TASK_PRIORITY       3
 #define HOST_LIB_TASK_STACK_SIZE 4096
-#define ENUM_TASK_STACK_SIZE     (5 * 1024)
+/* Sized to fit an inline HTTPS image fetch (M25) -- esp_http_client + TLS
+ * handshake needs meaningfully more than the 5KB this task ran with before
+ * image jobs existed. The fetch runs on enum_task itself rather than a
+ * dedicated task (contrast with M22's OTA download, which does get its own
+ * task): it blocks enum_task for the fetch's duration, delaying USB event
+ * processing and other queued jobs until it completes, which is an
+ * accepted tradeoff for a low-traffic personal device with occasional
+ * image jobs, not an oversight. Revisit with a dedicated fetch task if
+ * that stops being true. */
+#define ENUM_TASK_STACK_SIZE    (12 * 1024)
 #define MAX_TRACKED_DEVICES      8
 #define CLIENT_EVENT_POLL_MS     100
 #define INCOMING_JOB_QUEUE_LEN   PRINT_JOB_QUEUE_CAPACITY
@@ -65,6 +78,8 @@
  * appended here per job as a separate, deliberate addition. */
 #define ESCPOS_CUT_FULL_LEN 3
 static const uint8_t k_escpos_cut_full[ESCPOS_CUT_FULL_LEN] = {0x1D, 0x56, 0x00};
+
+static const char *TAG = "usb_printer_host";
 
 /* Image job "reference resolution" (M24): the queue only ever carries a
  * reference string, never bitmap bytes (see print_job_fsm.h); this is
@@ -127,17 +142,120 @@ static void build_width_test_stripes(void)
     s_width_test_bitmap_built = true;
 }
 
-/* Returns false (unresolvable reference) rather than crashing/asserting --
- * a real fetch (M25) can fail just as easily (network error, expired
- * reference, 404), so the caller already has to handle this path. */
-static bool resolve_image_reference(const char *ref, size_t ref_len, const uint8_t **out_bitmap,
-                                     size_t *out_width_bytes, size_t *out_height_px)
+/* Real server-fetched image jobs (M25). api_client encodes the reference
+ * as "{image_ref}:{width_dots}x{height_dots}" from the check-in response's
+ * job fields (see usb_printer_host.h) -- carrying the dimensions in the
+ * reference itself means this fetch knows exactly how many bytes to
+ * expect without a separate round-trip just to ask.
+ *
+ * Bit polarity: GET /images/{image_ref} already returns bytes with
+ * bit=1=print (server-side fixed to match GS v 0, not Pillow's own
+ * opposite convention) -- no inversion needed here.
+ *
+ * Capped well under what a truly enormous job could in principle request
+ * (slipstream-web's own MAX_IMAGE_OUTPUT_HEIGHT_DOTS default would still
+ * allow images up to ~144KB at full 576px width) -- this device's heap is
+ * shared with WiFi/TLS/BLE, so a single image allocation this large isn't
+ * safe to permit unconditionally; a job that would exceed the cap is
+ * rejected rather than risking heap exhaustion. */
+#define IMAGE_FETCH_HTTP_TIMEOUT_MS 15000
+#define IMAGE_FETCH_MAX_BITMAP_BYTES (64 * 1024)
+
+static const char *s_server_url;
+static const char *s_api_key;
+
+static bool fetch_server_image(const char *image_id, size_t width_dots, size_t height_dots, uint8_t **out_bitmap,
+                                size_t *out_width_bytes, size_t *out_height_px)
+{
+    size_t width_bytes = (width_dots + 7) / 8;
+    size_t bitmap_len = width_bytes * height_dots;
+    if (width_dots == 0 || height_dots == 0 || bitmap_len > IMAGE_FETCH_MAX_BITMAP_BYTES) {
+        ESP_LOGE(TAG, "Image job dimensions invalid or too large (%ux%u dots)", (unsigned)width_dots,
+                 (unsigned)height_dots);
+        return false;
+    }
+
+    uint8_t *bitmap = malloc(bitmap_len);
+    if (bitmap == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for image fetch", (unsigned)bitmap_len);
+        return false;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/images/%s", s_server_url, image_id);
+    char auth_header[128];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_api_key);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = IMAGE_FETCH_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to init HTTP client for image fetch");
+        free(bitmap);
+        return false;
+    }
+    esp_http_client_set_header(client, "Authorization", auth_header);
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Image fetch request failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(bitmap);
+        return false;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGW(TAG, "Image fetch returned HTTP %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(bitmap);
+        return false;
+    }
+
+    int read_len = esp_http_client_read_response(client, (char *)bitmap, bitmap_len);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (read_len < 0 || (size_t)read_len != bitmap_len) {
+        ESP_LOGW(TAG, "Image fetch returned %d bytes, expected %u", read_len, (unsigned)bitmap_len);
+        free(bitmap);
+        return false;
+    }
+
+    *out_bitmap = bitmap;
+    *out_width_bytes = width_bytes;
+    *out_height_px = height_dots;
+    return true;
+}
+
+/* Returns false (unresolvable reference, malformed encoding, fetch
+ * failure) rather than crashing/asserting -- a network fetch can fail in
+ * plenty of ordinary ways (expired reference already downloaded/deleted
+ * server-side, timeout, 404), so the caller already has to handle this
+ * path regardless. On success, *out_bitmap is heap-allocated and the
+ * caller owns it (must free() it after use) -- true uniformly for the
+ * demo bitmaps too (copied out of their static backing arrays into a
+ * fresh allocation), so start_next_print_job() has exactly one ownership
+ * rule to follow regardless of which reference resolved. */
+static bool resolve_image_reference(const char *ref, size_t ref_len, uint8_t **out_bitmap, size_t *out_width_bytes,
+                                     size_t *out_height_px)
 {
     if (ref_len == strlen(DEMO_IMAGE_REF) && memcmp(ref, DEMO_IMAGE_REF, ref_len) == 0) {
         if (!s_demo_bitmap_built) {
             build_demo_checkerboard();
         }
-        *out_bitmap = s_demo_bitmap;
+        size_t len = sizeof(s_demo_bitmap);
+        uint8_t *copy = malloc(len);
+        if (copy == NULL) {
+            return false;
+        }
+        memcpy(copy, s_demo_bitmap, len);
+        *out_bitmap = copy;
         *out_width_bytes = DEMO_IMAGE_WIDTH_BYTES;
         *out_height_px = DEMO_IMAGE_HEIGHT_PX;
         return true;
@@ -147,16 +265,36 @@ static bool resolve_image_reference(const char *ref, size_t ref_len, const uint8
         if (!s_width_test_bitmap_built) {
             build_width_test_stripes();
         }
-        *out_bitmap = s_width_test_bitmap;
+        size_t len = sizeof(s_width_test_bitmap);
+        uint8_t *copy = malloc(len);
+        if (copy == NULL) {
+            return false;
+        }
+        memcpy(copy, s_width_test_bitmap, len);
+        *out_bitmap = copy;
         *out_width_bytes = WIDTH_TEST_WIDTH_BYTES;
         *out_height_px = WIDTH_TEST_HEIGHT_PX;
         return true;
     }
 
-    return false;
-}
+    /* Otherwise, expect "{image_ref}:{width_dots}x{height_dots}" -- see
+     * usb_printer_host_enqueue_image()'s doc comment. image_ref is a UUID
+     * (36 chars), but sized generously here rather than hardcoded to that
+     * exact length. */
+    char image_id[64];
+    unsigned width_dots = 0;
+    unsigned height_dots = 0;
+    if (ref_len >= sizeof(image_id)) {
+        return false;
+    }
+    /* ref is NUL-terminated by print_job_queue_push()/the incoming-job
+     * message copy, so treating it as a plain C string here is safe. */
+    if (sscanf(ref, "%63[^:]:%ux%u", image_id, &width_dots, &height_dots) != 3) {
+        return false;
+    }
 
-static const char *TAG = "usb_printer_host";
+    return fetch_server_image(image_id, width_dots, height_dots, out_bitmap, out_width_bytes, out_height_px);
+}
 
 typedef enum {
     DEVICE_ACTION_OPEN            = (1 << 0),
@@ -443,7 +581,7 @@ static void start_next_print_job(void)
      * local array first -- enum_task's stack (ENUM_TASK_STACK_SIZE) is
      * sized for small text jobs, not for holding a whole image frame
      * twice over. */
-    const uint8_t *bitmap = NULL;
+    uint8_t *bitmap = NULL;
     size_t bitmap_width_bytes = 0;
     size_t bitmap_height_px = 0;
     size_t frame_capacity;
@@ -464,6 +602,7 @@ static void start_next_print_job(void)
     esp_err_t err = usb_host_transfer_alloc(frame_capacity, 0, &transfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate print transfer: %s", esp_err_to_name(err));
+        free(bitmap);
         print_job_fsm_handle_event(&s_driver.print_fsm, PRINT_JOB_EVENT_ERROR);
         return;
     }
@@ -475,6 +614,8 @@ static void start_next_print_job(void)
         frame_len =
             escpos_format_raster(bitmap, bitmap_width_bytes, bitmap_height_px, transfer->data_buffer, frame_capacity);
     }
+    free(bitmap); /* copied into transfer->data_buffer already (or never allocated, for text jobs) -- safe to free unconditionally, free(NULL) is a no-op */
+
     if (frame_len == 0) {
         ESP_LOGE(TAG, "escpos formatter failed to produce output for queued job");
         usb_host_transfer_free(transfer);
@@ -704,8 +845,11 @@ static void host_lib_task(void *arg)
     }
 }
 
-esp_err_t usb_printer_host_start(void)
+esp_err_t usb_printer_host_start(const char *server_url, const char *api_key)
 {
+    s_server_url = server_url;
+    s_api_key = api_key;
+
     memset(&s_driver, 0, sizeof(s_driver));
 
     s_incoming_jobs = xQueueCreate(INCOMING_JOB_QUEUE_LEN, sizeof(incoming_job_msg_t));
