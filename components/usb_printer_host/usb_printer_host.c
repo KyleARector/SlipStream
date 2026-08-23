@@ -179,6 +179,21 @@ static void build_width_test_stripes(void)
  * round-trip HTTP reads + USB transfers reasonable for a tall banner. */
 #define IMAGE_STREAM_CHUNK_BYTES 4096
 
+/* Max height (in dots/rows) of a single GS v 0 raster command when
+ * streaming a server image -- a tall banner is split into multiple bands,
+ * each its own complete raster command, rather than one continuous
+ * multi-hundred-KB command. Found empirically: a 576x5634 banner (~396KB
+ * as one continuous raster transfer) reliably knocked the printer off USB
+ * partway through (after roughly 850 rows successfully sent), leaving it
+ * stuck expecting more raster bytes than it was ever going to get -- see
+ * the ESC @ recovery below, which exists for exactly that case but can't
+ * help once the USB device handle itself has gone invalid. 256 is a
+ * conservative band height (~3x margin below the observed failure point
+ * at this width) chosen to avoid that outright disconnect, not a
+ * datasheet-confirmed limit -- may be tunable larger once the printer's
+ * actual per-command ceiling is known. */
+#define IMAGE_STREAM_BAND_HEIGHT_PX 256
+
 static const char *s_server_url;
 static const char *s_api_key;
 
@@ -382,22 +397,22 @@ static bool send_chunk_blocking(const uint8_t *data, size_t len)
     return true;
 }
 
-/* Streams a real server image to the printer: header, then bitmap data in
+/* Streams a real server image to the printer: bitmap data in
  * IMAGE_STREAM_CHUNK_BYTES-sized pieces read directly off the still-open
- * HTTP response, then the trailer -- never assembling the whole image in
- * one buffer, however tall it is. This is what actually removes the
- * height ceiling a single-buffer approach would otherwise impose (the
- * 2MB IMAGE_FETCH_MAX_BITMAP_BYTES cap is a sanity check, not a memory
- * limit -- see its comment). Each piece is sent via send_chunk_blocking(),
- * so this blocks enum_task for the whole transfer, same accepted tradeoff
- * as the rest of the image-job path. Gated on cut_after the same way as
- * the single-shot path below: when false, the trailer is just the raster
- * data's own LF -- no extra feed padding, no cut -- so this job's strip
- * stays physically joined to whatever prints right after it. */
+ * HTTP response, split into IMAGE_STREAM_BAND_HEIGHT_PX-tall bands each
+ * with its own GS v 0 header, then the trailer -- never assembling the
+ * whole image in one buffer, however tall it is, and never sending it as
+ * one continuous raster command either (see IMAGE_STREAM_BAND_HEIGHT_PX's
+ * comment for why: a single giant raster command was observed knocking
+ * the printer off USB partway through). Each piece is sent via
+ * send_chunk_blocking(), so this blocks enum_task for the whole transfer,
+ * same accepted tradeoff as the rest of the image-job path. Gated on
+ * cut_after the same way as the single-shot path below: when false, the
+ * trailer is just the raster data's own LF -- no extra feed padding, no
+ * cut -- so this job's strip stays physically joined to whatever prints
+ * right after it. */
 static bool stream_server_image(const image_job_info_t *info, bool cut_after)
 {
-    size_t total_len = info->width_bytes * info->height_px;
-
     char url[256];
     snprintf(url, sizeof(url), "%s/images/%s", s_server_url, info->image_id);
     char auth_header[128];
@@ -431,41 +446,54 @@ static bool stream_server_image(const image_job_info_t *info, bool cut_after)
         return false;
     }
 
-    uint8_t header_buf[ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN];
-    size_t header_len = escpos_format_raster_header(info->width_bytes, info->height_px, header_buf, sizeof(header_buf));
-    if (header_len == 0 || !send_chunk_blocking(header_buf, header_len)) {
-        ESP_LOGE(TAG, "Failed to send image stream header");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
     uint8_t chunk_buf[IMAGE_STREAM_CHUNK_BYTES];
-    size_t remaining = total_len;
+    size_t rows_remaining = info->height_px;
+    size_t total_remaining = info->width_bytes * info->height_px;
     bool ok = true;
-    while (remaining > 0 && ok) {
-        size_t want = remaining < sizeof(chunk_buf) ? remaining : sizeof(chunk_buf);
-        int read_len = esp_http_client_read(client, (char *)chunk_buf, want);
-        if (read_len <= 0) {
-            ESP_LOGW(TAG, "Image stream read failed (%d) with %u bytes remaining", read_len, (unsigned)remaining);
+
+    while (rows_remaining > 0 && ok) {
+        size_t band_height = rows_remaining < IMAGE_STREAM_BAND_HEIGHT_PX ? rows_remaining : IMAGE_STREAM_BAND_HEIGHT_PX;
+        size_t band_remaining = band_height * info->width_bytes;
+
+        uint8_t header_buf[ESCPOS_CMD_INIT_LEN + ESCPOS_CMD_RASTER_HEADER_LEN];
+        size_t header_len = escpos_format_raster_header(info->width_bytes, band_height, header_buf, sizeof(header_buf));
+        if (header_len == 0 || !send_chunk_blocking(header_buf, header_len)) {
+            ESP_LOGE(TAG, "Failed to send image stream band header");
             ok = false;
             break;
         }
-        ok = send_chunk_blocking(chunk_buf, (size_t)read_len);
-        remaining -= (size_t)read_len;
+
+        while (band_remaining > 0 && ok) {
+            size_t want = band_remaining < sizeof(chunk_buf) ? band_remaining : sizeof(chunk_buf);
+            int read_len = esp_http_client_read(client, (char *)chunk_buf, want);
+            if (read_len <= 0) {
+                ESP_LOGW(TAG, "Image stream read failed (%d) with %u bytes remaining in band, %u overall", read_len,
+                         (unsigned)band_remaining, (unsigned)total_remaining);
+                ok = false;
+                break;
+            }
+            ok = send_chunk_blocking(chunk_buf, (size_t)read_len);
+            band_remaining -= (size_t)read_len;
+            total_remaining -= (size_t)read_len;
+        }
+
+        rows_remaining -= band_height;
     }
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (!ok) {
-        /* The printer already received the GS v 0 header promising
-         * total_len raster bytes but got fewer than that -- force it out
-         * of raster mode now rather than leaving it to misinterpret
-         * whatever prints next as leftover pixel data. Best-effort: if
-         * this transfer also fails, there's nothing further to do. */
-        ESP_LOGW(TAG, "Image stream aborted with %u bytes remaining, resetting printer to recover from raster mode",
-                 (unsigned)remaining);
+        /* The printer already received the current band's GS v 0 header
+         * promising that band's full row count but got fewer bytes than
+         * that -- force it out of raster mode now rather than leaving it
+         * to misinterpret whatever prints next as leftover pixel data.
+         * Best-effort: if this transfer also fails (e.g. the USB device
+         * itself has already gone away, as happens if the disconnect that
+         * caused this failure was on the wire itself, not just the HTTP
+         * fetch), there's nothing further to do. */
+        ESP_LOGW(TAG, "Image stream aborted with %u bytes remaining overall, resetting printer to recover from raster mode",
+                 (unsigned)total_remaining);
         send_chunk_blocking(k_escpos_init, ESCPOS_CMD_INIT_LEN);
         return false;
     }
