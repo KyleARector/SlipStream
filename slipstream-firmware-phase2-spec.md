@@ -129,6 +129,27 @@ Is the office WiFi a simple WPA2-PSK network, or enterprise auth
 (WPA2/3-Enterprise)? The latter is a meaningfully larger firmware feature.
 Don't assume PSK without confirming.
 
+## Open Item — confirm before scoping M26
+
+Does the TM-H2000 actually expose paper-sensor status over USB, and if
+so, how? Same discipline as the print-width and QR-support open items:
+don't assume Epson's standard ESC/POS status commands (`DLE EOT n`
+real-time status, or `GS r n` transmit status) are supported by this
+specific unit without checking the real command reference. Also
+unconfirmed: whether the status byte layout (if supported) distinguishes
+"near-end"/low from "no paper"/out, or only reports a single
+present/absent bit.
+
+Confirmed separately (from the repo's own hardware notes, not
+assumption): no GPIO-level paper-out signal exists — this printer is
+USB-only, so any status has to come over the USB link itself. Also
+confirmed: this would be genuinely new firmware plumbing, not a small
+addition — `usb_printer_host` has only ever done fire-and-forget writes
+to the bulk OUT endpoint (0x01); reading status means claiming the
+bulk IN endpoint (0x82, already present in the device's USB descriptor
+but never used) and implementing an actual request/response transfer
+cycle, which doesn't exist anywhere in the driver today.
+
 ## Confirmed — TM-H2000 print width: 576 dots
 
 Confirmed empirically during M24: an 8-stripe, 576px-wide raster test
@@ -235,6 +256,21 @@ QR/image stretch milestones already scoped in the original spec)
     prints.
     - *Acceptance:* an image queued via the backend's API prints
       correctly on physical hardware, matching the source bitmap.
+
+26. **Paper roll status reporting** — **blocked on the Open Item above.**
+    If (and only if) confirmed supported: claim the bulk IN endpoint
+    (0x82) alongside the existing bulk OUT one, submit the real-time/
+    transmit status query, and parse the reply into a status the
+    check-in POST body (see `slipstream-web` M18) can carry — a plain
+    present/absent bit at minimum, low/out distinction if the status
+    byte layout actually supports it. This is new request/response USB
+    plumbing, not an extension of the existing fire-and-forget write
+    path — scope accordingly once the hardware capability is known, not
+    before.
+    - *Acceptance:* TBD once the Open Item is resolved — if the printer
+      doesn't support status queries at all, this milestone is dropped
+      rather than worked around with a guess (e.g. inferring paper-out
+      from a failed print) that the spec can't verify is reliable.
 
 ## Non-Goals for Phase 2
 
