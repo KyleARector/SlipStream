@@ -131,24 +131,108 @@ Don't assume PSK without confirming.
 
 ## Open Item — confirm before scoping M26
 
-Does the TM-H2000 actually expose paper-sensor status over USB, and if
-so, how? Same discipline as the print-width and QR-support open items:
-don't assume Epson's standard ESC/POS status commands (`DLE EOT n`
-real-time status, or `GS r n` transmit status) are supported by this
-specific unit without checking the real command reference. Also
-unconfirmed: whether the status byte layout (if supported) distinguishes
-"near-end"/low from "no paper"/out, or only reports a single
-present/absent bit.
+**Capability: confirmed supported.** Checked directly against Epson's own
+TM-H2000 Technical Reference Guide (not assumed, not community-sourced) —
+page 74's command-support table checks off both "Transmit status" (`GS r
+n`) and "Transmit real-time status" (`DLE EOT n`) for the Receipt paper
+sheet specifically, not just claimed generically for the ESC/POS family.
+So: yes, this specific unit supports paper sensor status queries.
 
-Confirmed separately (from the repo's own hardware notes, not
-assumption): no GPIO-level paper-out signal exists — this printer is
-USB-only, so any status has to come over the USB link itself. Also
-confirmed: this would be genuinely new firmware plumbing, not a small
-addition — `usb_printer_host` has only ever done fire-and-forget writes
-to the bulk OUT endpoint (0x01); reading status means claiming the
-bulk IN endpoint (0x82, already present in the device's USB descriptor
-but never used) and implementing an actual request/response transfer
-cycle, which doesn't exist anywhere in the driver today.
+**Status byte bit layout: high-confidence candidate, from a working
+reference implementation** — not the NDA-gated Epson guide (still don't
+have that), but Kyle has a separate working repo
+([piprinter](https://github.com/jrsalata/piprinter)) that correctly shows
+"Paper OK"/"Paper Low" on the same printer model, via the
+[python-escpos](https://python-escpos.readthedocs.io/) library's
+`paper_status()`. Traced through python-escpos's actual source
+(`escpos.py`, `constants.py`):
+
+- Command is `DLE EOT 4` (`RT_STATUS_PAPER = DLE + EOT + \x04` =
+  `{0x10, 0x04, 0x04}`) — matches this spec's own independent pick below
+  exactly, sent as one 3-byte write, one status byte read back.
+- Reply byte bit layout, cross-checked against Epson's own documented
+  response-framing pattern (`0xx1xx10` from the public `GS r` reference
+  page — bits 0, 1, 4, 7 fixed, bits 2/3/5/6 are the actual data):
+  - Bits **2 and 3** (as a pair): near-end/low paper sensor
+  - Bits **5 and 6** (as a pair): out-of-paper sensor
+  - Bits 0, 1, 4, 7: fixed framing, not sensor data
+- Decision logic (`RT_MASK_NOPAPER=114`/`0x72`, `RT_MASK_LOWPAPER=30`/`0x1E`,
+  `RT_MASK_PAPER=18`/`0x12`, checked in this order):
+  1. `byte & 0x72 == 0x72` → no paper
+  2. else `byte & 0x1E == 0x1E` → paper low/near-end
+  3. else → paper OK
+
+Two independent sources agreeing (Epson's own framing pattern + a library
+proven working on this exact printer model) is about as solid as this
+gets without the NDA'd Application Programming Guide. Treat this as the
+implementation's actual parsing logic, not just a guess to sanity-check —
+but the physical full/near-end/empty test below is still worth running,
+now as confirmation rather than blind exploration.
+
+**Also confirmed** (from the repo's own hardware notes): no GPIO-level
+paper-out signal exists — this printer is USB-only, so any status has to
+come over the USB link itself. And this is genuinely new firmware
+plumbing, not a small addition — `usb_printer_host` has only ever done
+fire-and-forget writes to the bulk OUT endpoint (`0x01`); reading status
+means claiming the bulk IN endpoint (`0x82`, already present in the
+device's USB descriptor but never used) and implementing an actual
+request/response transfer cycle, which doesn't exist anywhere in the
+driver today.
+
+### Precursor implementation — scoped, ready to build, not yet built
+
+Drafted and fully compiled (both the disabled and enabled code paths)
+against IDF 5.5.1 in a sandboxed session on 2026-08-22, then **reverted
+before flashing** — that session's toolchain was 5.5.1 while this repo's
+Phase 2 work has been built against 5.5.5, and it also lacked a real
+`secrets.h`, so flashing it would have knocked the device off the network
+until back on the home Mac with the right toolchain and credentials. No
+hardware was touched. Rebuild this on the correct machine rather than
+trusting the sandboxed compile as sufficient verification.
+
+Shape of the change, all in `usb_printer_host.c`:
+- `find_bulk_in_endpoint()` — mirrors the existing `find_bulk_out_endpoint()`,
+  just checking the IN direction bit instead. Called alongside the OUT
+  discovery in `action_get_config_desc()`; stores `printer_bulk_in_ep`
+  next to the existing `printer_bulk_out_ep`. Treated as optional (log a
+  warning, don't refuse to treat the device as the printer) since basic
+  printing never needed it.
+- `read_bulk_in_blocking()` — a bulk IN counterpart to the existing
+  `send_chunk_blocking()` helper (added during the image-streaming work),
+  reusing the same self-pumping-`usb_host_client_handle_events()` pattern
+  so it can block sequentially on `enum_task` without deadlocking against
+  itself. Own semaphore/status/buffer statics, kept separate from the
+  image-chunk ones for clarity even though the mechanism is identical.
+- `probe_paper_status()` — sends `DLE EOT 4` (`{0x10, 0x04, 0x04}`, raw,
+  no ESC/POS init sequence prepended — real-time commands are designed to
+  bypass the normal command buffer) via the existing `send_chunk_blocking()`,
+  reads back whatever comes over bulk IN, and logs the raw reply in both
+  hex and binary. `GS r 1` is the documented fallback if the reply looks
+  wrong (e.g. always 0x00, or doesn't match the `0xx1xx10` framing pattern
+  noted above).
+- Now that python-escpos's masks give a high-confidence bit layout (see
+  above), this should log the *decoded* result too, not just the raw
+  byte: apply `byte & 0x72 == 0x72` (no paper) → `byte & 0x1E == 0x1E`
+  (low) → else OK, in that order, and log both the raw byte and the
+  decoded label side by side. Still no check-in integration -- that's
+  real M26, once the physical test below confirms the decode is actually
+  right for this unit, not just for piprinter's.
+- Periodic, not one-shot: gated behind `ENABLE_PAPER_STATUS_PROBE` (off by
+  default, same convention as the other demo flags) but fires on a
+  `PAPER_STATUS_PROBE_INTERVAL_MS` (5000ms) timer rather than once at
+  boot, so a physical paper swap (full / near-end / removed) can be
+  watched live in the console log without reflashing between each test
+  point.
+
+**Test plan once rebuilt on the home Mac:** flip `ENABLE_PAPER_STATUS_PROBE`
+to 1, flash, and log the raw byte across three physical states — full
+roll, a roll near the end (naturally low, or by adjusting the printer's
+physical NE sensor position per the Technical Reference Guide's setup
+section), and paper removed entirely. Kyle has both a full roll and a
+near-empty one on hand already. Comparing all three (not just full vs.
+empty) is what actually answers the near-end-vs-out bit-layout question —
+two points alone would only confirm the feature works, not resolve the
+layout.
 
 ## Confirmed — TM-H2000 print width: 576 dots
 
